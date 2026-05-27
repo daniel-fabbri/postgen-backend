@@ -208,6 +208,7 @@ class GeneratePostRequest(BaseModel):
 
 
 class Post(BaseModel):
+    id: str = ""
     text: str
     image_url: str
 
@@ -861,7 +862,7 @@ Return only the post text."""
     db.add(p)
     db.commit()
 
-    return Post(text=post_text, image_url=image_url)
+    return Post(id=post_id, text=post_text, image_url=image_url)
 
 
 @app.post("/api/posts/{post_id}/image/upload")
