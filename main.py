@@ -1,10 +1,8 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List
-import json
 import os
 import base64
 import shutil
@@ -14,12 +12,13 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, Column, String, Text, Boolean, Integer,
-    DateTime, ForeignKey, event
+    DateTime, ForeignKey
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 load_dotenv()
 
@@ -39,6 +38,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "changeme-insecure-default-secret-32chars!!")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
+
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "images")
 
 # ---------------------------------------------------------------------------
 # Database
@@ -116,14 +118,6 @@ class SettingsDB(Base):
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
-POSTS_DIR = os.path.join(BASE_DIR, "posts")
-IMAGES_DIR = os.path.join(POSTS_DIR, "images")
-AVATARS_DIR = os.path.join(BASE_DIR, "avatars")
-
-os.makedirs(POSTS_DIR, exist_ok=True)
-os.makedirs(IMAGES_DIR, exist_ok=True)
-os.makedirs(AVATARS_DIR, exist_ok=True)
-
 app = FastAPI(title="PostGen API")
 
 app.add_middleware(
@@ -134,8 +128,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/posts/images", StaticFiles(directory=IMAGES_DIR), name="post_images")
-app.mount("/avatars", StaticFiles(directory=AVATARS_DIR), name="avatars")
+
+# ---------------------------------------------------------------------------
+# Blob storage helpers
+# ---------------------------------------------------------------------------
+def _blob_client():
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        raise HTTPException(status_code=500, detail="Azure Storage não configurado")
+    return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+
+
+def upload_bytes_to_blob(data: bytes, blob_name: str, content_type: str = "image/png") -> str:
+    client = _blob_client()
+    container = client.get_container_client(AZURE_STORAGE_CONTAINER)
+    blob = container.get_blob_client(blob_name)
+    blob.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type=content_type))
+    return blob.url
+
+
+def upload_file_to_blob(file_path: str, blob_name: str, content_type: str = "image/png") -> str:
+    with open(file_path, "rb") as f:
+        data = f.read()
+    return upload_bytes_to_blob(data, blob_name, content_type)
 
 
 @app.on_event("startup")
@@ -340,13 +354,12 @@ def get_azure_client(s: SettingsDB) -> AzureOpenAI:
 # Image helpers
 # ---------------------------------------------------------------------------
 def save_image_from_base64(base64_data: str, post_id: str) -> str:
+    """Upload base64 image to blob storage, return blob URL."""
     if base64_data.startswith("data:image"):
         base64_data = base64_data.split(",")[1]
     image_bytes = base64.b64decode(base64_data)
-    image_filename = f"{post_id}.png"
-    with open(os.path.join(IMAGES_DIR, image_filename), "wb") as f:
-        f.write(image_bytes)
-    return f"images/{image_filename}"
+    blob_name = f"posts/{post_id}.png"
+    return upload_bytes_to_blob(image_bytes, blob_name, "image/png")
 
 
 def channel_to_schema(ch: ChannelDB) -> Channel:
@@ -531,9 +544,8 @@ def create_channel(
                     if result.get("data") and "b64_json" in result["data"][0]:
                         avatar_filename = f"{ch.id}.png"
                         image_bytes = base64.b64decode(result["data"][0]["b64_json"])
-                        with open(os.path.join(AVATARS_DIR, avatar_filename), "wb") as f:
-                            f.write(image_bytes)
-                        ch.avatar_url = f"{BASE_URL}/avatars/{avatar_filename}"
+                        avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
+                        ch.avatar_url = avatar_url
                         _register_avatar(avatar_filename, ch.id, db)
                         db.commit()
                         db.refresh(ch)
@@ -633,13 +645,12 @@ def list_avatars(
 
     result = []
     for row in rows:
-        file_path = os.path.join(AVATARS_DIR, row.filename)
-        if os.path.exists(file_path):
-            result.append(AvatarInfo(
-                filename=row.filename,
-                url=f"{BASE_URL}/avatars/{row.filename}",
-                created_at=row.created_at.isoformat() if row.created_at else None,
-            ))
+        blob_url = f"https://postgenstorage.blob.core.windows.net/{AZURE_STORAGE_CONTAINER}/avatars/{row.filename}"
+        result.append(AvatarInfo(
+            filename=row.filename,
+            url=blob_url,
+            created_at=row.created_at.isoformat() if row.created_at else None,
+        ))
     return sorted(result, key=lambda x: x.created_at or "", reverse=True)
 
 
@@ -655,7 +666,6 @@ def generate_avatar(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     avatar_filename = f"avatar_{timestamp}.png"
-    avatar_path = os.path.join(AVATARS_DIR, avatar_filename)
 
     resp = requests.post(
         s.azure_openai_image_endpoint,
@@ -673,10 +683,7 @@ def generate_avatar(
         raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
 
     image_bytes = base64.b64decode(result["data"][0]["b64_json"])
-    with open(avatar_path, "wb") as f:
-        f.write(image_bytes)
-
-    avatar_url = f"{BASE_URL}/avatars/{avatar_filename}"
+    avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
 
     if data.channel_id:
         ch = get_channel_or_404(data.channel_id, current_user, db)
@@ -700,12 +707,9 @@ def upload_avatar(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     ext = file.filename.split(".")[-1] if "." in file.filename else "png"
     avatar_filename = f"avatar_{timestamp}.{ext}"
-    avatar_path = os.path.join(AVATARS_DIR, avatar_filename)
 
-    with open(avatar_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    avatar_url = f"{BASE_URL}/avatars/{avatar_filename}"
+    data = file.file.read()
+    avatar_url = upload_bytes_to_blob(data, f"avatars/{avatar_filename}", file.content_type or "image/png")
 
     if channel_id:
         ch = get_channel_or_404(channel_id, current_user, db)
@@ -839,30 +843,30 @@ Return only the post text."""
         except Exception as e:
             print(f"Image generation failed: {e}")
 
-    # Save post
+    # Save post — upload image to blob, store blob URL
     post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    image_path = ""
+    blob_url = ""
     if image_url.startswith("data:image"):
         try:
-            image_path = save_image_from_base64(image_url, post_id)
+            blob_url = save_image_from_base64(image_url, post_id)
         except Exception as e:
-            print(f"Error saving image: {e}")
-            image_path = "placeholder"
+            print(f"Error uploading image to blob: {e}")
+            blob_url = image_url  # fallback: keep base64
     else:
-        image_path = image_url
+        blob_url = image_url
 
     p = PostDB(
         id=post_id,
         channel_id=ch.id,
         channel_name=ch.name,
         text=post_text,
-        image_path=image_path,
+        image_path=blob_url,
         published=False,
     )
     db.add(p)
     db.commit()
 
-    return Post(id=post_id, text=post_text, image_url=image_url)
+    return Post(id=post_id, text=post_text, image_url=blob_url)
 
 
 @app.post("/api/posts/{post_id}/image/upload")
@@ -876,16 +880,14 @@ def upload_post_image(
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
 
-    image_filename = f"{post_id}.png"
-    with open(os.path.join(IMAGES_DIR, image_filename), "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    p.image_path = f"images/{image_filename}"
+    data = file.file.read()
+    blob_url = upload_bytes_to_blob(data, f"posts/{post_id}.png", file.content_type or "image/png")
+    p.image_path = blob_url
     db.commit()
     return {
         "success": True,
-        "image_url": f"{BASE_URL}/posts/images/{image_filename}",
-        "image_path": p.image_path,
+        "image_url": blob_url,
+        "image_path": blob_url,
     }
 
 
@@ -914,15 +916,13 @@ def generate_post_image(
     if not result.get("data") or "b64_json" not in result["data"][0]:
         raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
 
-    image_path = save_image_from_base64(result["data"][0]["b64_json"], post_id)
-    p.image_path = image_path
+    blob_url = save_image_from_base64(result["data"][0]["b64_json"], post_id)
+    p.image_path = blob_url
     db.commit()
-
-    image_filename = f"{post_id}.png"
     return {
         "success": True,
-        "image_url": f"{BASE_URL}/posts/images/{image_filename}",
-        "image_path": image_path,
+        "image_url": blob_url,
+        "image_path": blob_url,
     }
 
 
@@ -941,9 +941,7 @@ def publish_post(
             detail="Instagram não configurado para este canal.",
         )
 
-    s = get_or_create_settings(current_user, db)
-    public_base = s.public_base_url.rstrip("/")
-    image_url = f"{public_base}/posts/{p.image_path}"
+    image_url = p.image_path  # blob URL stored directly
 
     try:
         create_resp = requests.post(
