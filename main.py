@@ -249,6 +249,11 @@ class UpdateAvatarRequest(BaseModel):
     avatar_url: str
 
 
+class TestInstagramRequest(BaseModel):
+    instagram_user_id: Optional[str] = None
+    instagram_access_token: Optional[str] = None
+
+
 class AvatarInfo(BaseModel):
     filename: str
     url: str
@@ -612,6 +617,44 @@ def update_channel_avatar(
     db.commit()
     db.refresh(ch)
     return {"success": True, "channel": channel_to_schema(ch)}
+
+
+@app.post("/api/channels/{channel_id}/test-instagram")
+def test_instagram_connection(
+    channel_id: str,
+    data: TestInstagramRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ch = get_channel_or_404(channel_id, current_user, db)
+
+    user_id = data.instagram_user_id or ch.instagram_user_id
+    token = data.instagram_access_token if (data.instagram_access_token and data.instagram_access_token != "***") else ch.instagram_access_token
+
+    if not user_id or not token:
+        raise HTTPException(status_code=400, detail="Preencha o User ID e o Access Token antes de testar.")
+
+    try:
+        resp = requests.get(
+            f"https://graph.facebook.com/v21.0/{user_id}",
+            params={"fields": "id,name,username,followers_count", "access_token": token},
+            timeout=10,
+        )
+        result = resp.json()
+        if "error" in result:
+            msg = result["error"].get("message", "Erro desconhecido")
+            return {"success": False, "error": msg}
+        return {
+            "success": True,
+            "account": {
+                "id": result.get("id"),
+                "name": result.get("name"),
+                "username": result.get("username"),
+                "followers_count": result.get("followers_count"),
+            },
+        }
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao conectar com o Instagram: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
