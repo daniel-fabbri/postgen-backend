@@ -42,6 +42,9 @@ JWT_EXPIRE_DAYS = 30
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "images")
 
+AZURE_SORA_ENDPOINT = os.getenv("AZURE_SORA_ENDPOINT", "").rstrip("/")
+AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -76,6 +79,7 @@ class ChannelDB(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user = relationship("UserDB", back_populates="channels")
     posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
+    videos = relationship("VideoDB", back_populates="channel", cascade="all, delete-orphan")
     avatars = relationship("AvatarDB", back_populates="channel")
 
 
@@ -89,6 +93,20 @@ class PostDB(Base):
     published = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     channel = relationship("ChannelDB", back_populates="posts")
+
+
+class VideoDB(Base):
+    __tablename__ = "videos"
+    id = Column(String(100), primary_key=True)
+    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    channel_name = Column(String(255), nullable=False)
+    prompt = Column(Text, default="")
+    video_path = Column(Text, default="")
+    duration_seconds = Column(Integer, default=4)
+    size = Column(String(20), default="720x1280")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    published = Column(Boolean, default=False)
+    channel = relationship("ChannelDB", back_populates="videos")
 
 
 class AvatarDB(Base):
@@ -252,6 +270,28 @@ class UpdateAvatarRequest(BaseModel):
 class TestInstagramRequest(BaseModel):
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
+
+
+class GenerateVideoRequest(BaseModel):
+    channel_id: str
+    additional_prompt: Optional[str] = None
+    seconds: int = 4
+    size: str = "720x1280"
+
+
+class SavedVideo(BaseModel):
+    id: str
+    channel_id: str
+    channel_name: str
+    prompt: str
+    video_path: str
+    duration_seconds: int
+    size: str
+    created_at: str
+    published: bool = False
+
+    class Config:
+        from_attributes = True
 
 
 class AvatarInfo(BaseModel):
@@ -1015,6 +1055,161 @@ def publish_post(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Videos endpoints
+# ---------------------------------------------------------------------------
+def video_to_schema(v: VideoDB) -> SavedVideo:
+    return SavedVideo(
+        id=v.id,
+        channel_id=v.channel_id,
+        channel_name=v.channel_name,
+        prompt=v.prompt or "",
+        video_path=v.video_path or "",
+        duration_seconds=v.duration_seconds or 4,
+        size=v.size or "720x1280",
+        created_at=v.created_at.isoformat() if v.created_at else datetime.now().isoformat(),
+        published=v.published or False,
+    )
+
+
+def _sora_headers():
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {AZURE_SORA_API_KEY}"}
+
+
+@app.get("/api/videos", response_model=List[SavedVideo])
+def get_videos(
+    channel_id: Optional[str] = None,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
+    ]
+    q = db.query(VideoDB).filter(VideoDB.channel_id.in_(user_channel_ids))
+    if channel_id:
+        q = q.filter(VideoDB.channel_id == channel_id)
+    return [video_to_schema(v) for v in q.order_by(VideoDB.created_at.desc()).all()]
+
+
+@app.post("/api/videos/generate", response_model=SavedVideo)
+def generate_video(
+    data: GenerateVideoRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not AZURE_SORA_ENDPOINT or not AZURE_SORA_API_KEY:
+        raise HTTPException(status_code=400, detail="Sora não configurado. Defina AZURE_SORA_ENDPOINT e AZURE_SORA_API_KEY.")
+
+    ch = get_channel_or_404(data.channel_id, current_user, db)
+    s = get_or_create_settings(current_user, db)
+
+    # Build prompt from channel config
+    base_prompt = ch.image_generation_prompt or f"Instagram Reel for channel '{ch.name}'. Theme: {ch.objective}."
+    prompt = base_prompt
+    if data.additional_prompt:
+        prompt += f" {data.additional_prompt}"
+
+    # Create Sora job
+    try:
+        create_resp = requests.post(
+            AZURE_SORA_ENDPOINT,
+            headers=_sora_headers(),
+            json={
+                "prompt": prompt,
+                "model": "sora-2",
+                "size": data.size,
+                "seconds": str(data.seconds),
+            },
+            timeout=30,
+        )
+        create_resp.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao criar job Sora: {str(e)}")
+
+    job = create_resp.json()
+    print(f"Sora job created: {job}")
+    job_id = job.get("id") or job.get("job_id") or job.get("generation_id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail=f"Resposta inesperada do Sora: {job}")
+
+    # Poll until complete (max 3 minutes)
+    poll_url = f"{AZURE_SORA_ENDPOINT}/{job_id}"
+    deadline = datetime.now().timestamp() + 180
+    video_url = None
+    while datetime.now().timestamp() < deadline:
+        import time
+        time.sleep(5)
+        try:
+            poll_resp = requests.get(poll_url, headers=_sora_headers(), timeout=15)
+            result = poll_resp.json()
+            print(f"Sora poll: {result.get('status', result)}")
+        except Exception as e:
+            print(f"Sora poll error: {e}")
+            continue
+
+        status = result.get("status", "")
+        if status in ("succeeded", "completed", "done"):
+            # Extract video URL from various possible response shapes
+            gens = result.get("generations") or result.get("outputs") or []
+            if gens:
+                video_url = gens[0].get("url") or gens[0].get("video_url")
+            if not video_url:
+                video_url = result.get("url") or result.get("video_url") or result.get("result", {}).get("url")
+            break
+        if status in ("failed", "error", "cancelled"):
+            err = result.get("error", {}).get("message") or result.get("message") or "Job falhou"
+            raise HTTPException(status_code=502, detail=f"Sora falhou: {err}")
+
+    if not video_url:
+        raise HTTPException(status_code=504, detail="Timeout aguardando o Sora. Tente novamente.")
+
+    # Download video and upload to blob
+    video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    try:
+        dl = requests.get(video_url, timeout=60, stream=True)
+        dl.raise_for_status()
+        video_bytes = dl.content
+        blob_url = upload_bytes_to_blob(video_bytes, f"videos/{video_id}.mp4", "video/mp4")
+    except Exception as e:
+        # If download fails (expired URL), store the original URL temporarily
+        print(f"Video download failed: {e}. Storing original URL.")
+        blob_url = video_url
+
+    v = VideoDB(
+        id=video_id,
+        channel_id=ch.id,
+        channel_name=ch.name,
+        prompt=prompt,
+        video_path=blob_url,
+        duration_seconds=data.seconds,
+        size=data.size,
+        published=False,
+    )
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+    return video_to_schema(v)
+
+
+@app.delete("/api/videos/{video_id}", status_code=204)
+def delete_video(
+    video_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    db.delete(v)
+    db.commit()
 
 
 if __name__ == "__main__":
