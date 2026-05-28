@@ -422,7 +422,8 @@ def save_image_from_base64(base64_data: str, post_id: str) -> str:
     if base64_data.startswith("data:image"):
         base64_data = base64_data.split(",")[1]
     image_bytes = base64.b64decode(base64_data)
-    blob_name = f"posts/{post_id}.png"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    blob_name = f"posts/{post_id}_{ts}.png"
     return upload_bytes_to_blob(image_bytes, blob_name, "image/png")
 
 
@@ -1124,7 +1125,9 @@ def upload_post_image(
         raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
 
     data = file.file.read()
-    blob_url = upload_bytes_to_blob(data, f"posts/{post_id}.png", file.content_type or "image/png")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    ext = (file.content_type or "image/png").split("/")[-1].replace("jpeg", "jpg")
+    blob_url = upload_bytes_to_blob(data, f"posts/{post_id}_{ts}.{ext}", file.content_type or "image/png")
     p.image_path = blob_url
     db.commit()
     return {
