@@ -666,6 +666,7 @@ def delete_channel(
 
 
 @app.patch("/api/channels/{channel_id}/avatar")
+@app.post("/api/channels/{channel_id}/avatar")
 def update_channel_avatar(
     channel_id: str,
     data: UpdateAvatarRequest,
@@ -974,6 +975,7 @@ def get_post(
 
 
 @app.patch("/api/posts/{post_id}", response_model=SavedPost)
+@app.post("/api/posts/{post_id}/save", response_model=SavedPost)
 def update_post(
     post_id: str,
     data: UpdatePostRequest,
@@ -1126,10 +1128,17 @@ def generate_post_image(
     if not s.azure_openai_image_endpoint:
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
+    ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+    channel_prompt = (ch.image_generation_prompt or "") if ch else ""
+    if channel_prompt and data.prompt:
+        full_prompt = f"{channel_prompt}\n\n{data.prompt}"
+    else:
+        full_prompt = channel_prompt or data.prompt
+
     resp = requests.post(
         s.azure_openai_image_endpoint,
         headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-        json={"prompt": data.prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
+        json={"prompt": full_prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
         timeout=60,
     )
     if resp.status_code != 200:
