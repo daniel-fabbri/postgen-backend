@@ -1266,6 +1266,7 @@ def generate_video(
     prompt = base_prompt
     if data.additional_prompt:
         prompt += f" {data.additional_prompt}"
+    prompt = prompt[:4000]  # Sora max prompt length
 
     print(f"Sora prompt ({len(prompt)} chars): {prompt[:200]}")
     # Create Sora job (kick off async before generating caption)
