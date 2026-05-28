@@ -888,19 +888,37 @@ def generate_avatar(
     if not s.azure_openai_image_endpoint:
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
+    # Use channel's image_generation_prompt (first 5 lines) as visual identity base
+    channel_prompt = ""
+    if data.channel_id:
+        ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+        if ch and ch.image_generation_prompt:
+            channel_prompt = "\n".join(ch.image_generation_prompt.splitlines()[:5])
+
+    portrait_suffix = "\n\nFrame: Close-up portrait style, profile picture format."
+    if channel_prompt and data.prompt:
+        full_prompt = f"{channel_prompt}\n\n{data.prompt}{portrait_suffix}"
+    else:
+        full_prompt = (channel_prompt or data.prompt) + portrait_suffix
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     avatar_filename = f"avatar_{timestamp}.png"
 
-    resp = requests.post(
-        s.azure_openai_image_endpoint,
-        headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-        json={
-            "prompt": data.prompt + "\n\nFrame: Close-up portrait style, profile picture format.",
-            "width": 768, "height": 768, "model": s.azure_openai_image_deployment,
-        },
-    )
+    def _call_avatar_api(prompt: str):
+        return requests.post(
+            s.azure_openai_image_endpoint,
+            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
+            json={"prompt": prompt, "width": 768, "height": 768, "model": s.azure_openai_image_deployment},
+        )
+
+    resp = _call_avatar_api(full_prompt)
     if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {resp.text}")
+        err_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        err_code = err_body.get("error", {}).get("code", "") if isinstance(err_body.get("error"), dict) else ""
+        if err_code == "content_safety_violation" and data.prompt and channel_prompt:
+            resp = _call_avatar_api(data.prompt + portrait_suffix)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {resp.text}")
 
     result = resp.json()
     if not result.get("data") or "b64_json" not in result["data"][0]:
