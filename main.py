@@ -1267,6 +1267,7 @@ def generate_video(
     if data.additional_prompt:
         prompt += f" {data.additional_prompt}"
 
+    print(f"Sora prompt ({len(prompt)} chars): {prompt[:200]}")
     # Create Sora job (kick off async before generating caption)
     # Endpoint: POST {AZURE_SORA_ENDPOINT}  (e.g. https://postgen-ai.services.ai.azure.com/openai/v1/videos)
     try:
@@ -1281,7 +1282,11 @@ def generate_video(
             },
             timeout=30,
         )
+        if not create_resp.ok:
+            raise HTTPException(status_code=502, detail=f"Falha ao criar job Sora: {create_resp.status_code} - {create_resp.text}")
         create_resp.raise_for_status()
+    except HTTPException:
+        raise
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Falha ao criar job Sora: {str(e)}")
 
