@@ -442,12 +442,16 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
 
 
 def post_to_schema(p: PostDB) -> SavedPost:
+    image_path = p.image_path or ""
+    # Don't send base64 blobs over the wire — they bloat responses and cause network errors
+    if image_path.startswith("data:"):
+        image_path = ""
     return SavedPost(
         id=p.id,
         channel_id=p.channel_id,
         channel_name=p.channel_name,
         text=p.text or "",
-        image_path=p.image_path or "",
+        image_path=image_path,
         created_at=p.created_at.isoformat() if p.created_at else datetime.now().isoformat(),
         published=p.published or False,
     )
