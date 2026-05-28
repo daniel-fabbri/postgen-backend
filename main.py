@@ -1135,14 +1135,24 @@ def generate_post_image(
     else:
         full_prompt = channel_prompt or data.prompt
 
-    resp = requests.post(
-        s.azure_openai_image_endpoint,
-        headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-        json={"prompt": full_prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
-        timeout=60,
-    )
+    def _call_image_api(prompt: str):
+        return requests.post(
+            s.azure_openai_image_endpoint,
+            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
+            json={"prompt": prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
+            timeout=60,
+        )
+
+    resp = _call_image_api(full_prompt)
     if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {resp.text}")
+        err_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        err_code = err_body.get("error", {}).get("code", "") if isinstance(err_body.get("error"), dict) else ""
+        # If combined prompt triggers content safety, retry with user prompt only
+        if err_code == "content_safety_violation" and data.prompt and channel_prompt:
+            print(f"Content safety on combined prompt, retrying with user-only prompt")
+            resp = _call_image_api(data.prompt)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {resp.text}")
 
     result = resp.json()
     if not result.get("data") or "b64_json" not in result["data"][0]:
