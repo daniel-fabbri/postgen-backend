@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from urllib.parse import urlencode
 from pydantic import BaseModel
 from typing import Optional, List
 import os
@@ -12,7 +14,7 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, Column, String, Text, Boolean, Integer,
-    DateTime, ForeignKey
+    DateTime, ForeignKey, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -44,6 +46,10 @@ AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "images")
 
 AZURE_SORA_ENDPOINT = os.getenv("AZURE_SORA_ENDPOINT", "").rstrip("/")
 AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
+
+INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
+INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # ---------------------------------------------------------------------------
 # Database
@@ -101,6 +107,7 @@ class VideoDB(Base):
     channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     channel_name = Column(String(255), nullable=False)
     prompt = Column(Text, default="")
+    caption = Column(Text, default="")
     video_path = Column(Text, default="")
     duration_seconds = Column(Integer, default=4)
     size = Column(String(20), default="720x1280")
@@ -173,6 +180,13 @@ def upload_file_to_blob(file_path: str, blob_name: str, content_type: str = "ima
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    # Add caption column to videos if missing (safe migration)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT ''"))
+            conn.commit()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +298,7 @@ class SavedVideo(BaseModel):
     channel_id: str
     channel_name: str
     prompt: str
+    caption: str = ""
     video_path: str
     duration_seconds: int
     size: str
@@ -292,6 +307,10 @@ class SavedVideo(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UpdateVideoCaptionRequest(BaseModel):
+    caption: str
 
 
 class AvatarInfo(BaseModel):
@@ -659,6 +678,123 @@ def update_channel_avatar(
     return {"success": True, "channel": channel_to_schema(ch)}
 
 
+def _ig_api_base(token: str) -> str:
+    if token and token.startswith("IG"):
+        return "https://graph.instagram.com/v21.0"
+    return "https://graph.facebook.com/v21.0"
+
+
+@app.get("/api/auth/instagram/authorize")
+def instagram_authorize(
+    channel_id: str = Query(...),
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
+        raise HTTPException(status_code=500, detail="Instagram OAuth não configurado no servidor.")
+    get_channel_or_404(channel_id, current_user, db)
+    state = jwt.encode(
+        {"channel_id": channel_id, "user_id": current_user.id, "exp": datetime.now(timezone.utc) + timedelta(minutes=15)},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    params = {
+        "client_id": INSTAGRAM_APP_ID,
+        "redirect_uri": f"{BASE_URL}/api/auth/instagram/callback",
+        "scope": "instagram_business_basic,instagram_business_content_publish",
+        "response_type": "code",
+        "state": state,
+    }
+    return {"url": "https://www.instagram.com/oauth/authorize?" + urlencode(params)}
+
+
+@app.get("/api/auth/instagram/callback")
+def instagram_callback(
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    db: Session = Depends(get_db),
+):
+    front = FRONTEND_URL.rstrip("/")
+    if error or not code or not state:
+        return RedirectResponse(url=f"{front}/channels?ig_error=cancelled")
+
+    try:
+        state_data = jwt.decode(state, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        channel_id = state_data["channel_id"]
+        user_id = state_data["user_id"]
+    except JWTError:
+        return RedirectResponse(url=f"{front}/channels?ig_error=invalid_state")
+
+    redirect_uri = f"{BASE_URL}/api/auth/instagram/callback"
+    try:
+        token_resp = requests.post(
+            "https://api.instagram.com/oauth/access_token",
+            data={
+                "client_id": INSTAGRAM_APP_ID,
+                "client_secret": INSTAGRAM_APP_SECRET,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+                "code": code,
+            },
+            timeout=15,
+        )
+        token_data = token_resp.json()
+        if "access_token" not in token_data:
+            err = token_data.get("error_message", "token_exchange_failed")
+            return RedirectResponse(url=f"{front}/channels/{channel_id}/edit?ig_error={err}")
+
+        short_token = token_data["access_token"]
+        ig_user_id = str(token_data["user_id"])
+
+        ll_resp = requests.get(
+            "https://graph.instagram.com/access_token",
+            params={
+                "grant_type": "ig_exchange_token",
+                "client_id": INSTAGRAM_APP_ID,
+                "client_secret": INSTAGRAM_APP_SECRET,
+                "access_token": short_token,
+            },
+            timeout=15,
+        )
+        long_token = ll_resp.json().get("access_token", short_token)
+
+        me_resp = requests.get(
+            "https://graph.instagram.com/me",
+            params={"fields": "id,username", "access_token": long_token},
+            timeout=10,
+        )
+        username = me_resp.json().get("username", ig_user_id)
+
+        ch = db.query(ChannelDB).filter(
+            ChannelDB.id == channel_id,
+            ChannelDB.user_id == user_id,
+        ).first()
+        if not ch:
+            return RedirectResponse(url=f"{front}/channels?ig_error=channel_not_found")
+
+        ch.instagram_user_id = ig_user_id
+        ch.instagram_access_token = long_token
+        db.commit()
+        return RedirectResponse(url=f"{front}/channels/{channel_id}/edit?ig_success={username}")
+
+    except requests.RequestException:
+        return RedirectResponse(url=f"{front}/channels/{channel_id}/edit?ig_error=network_error")
+
+
+@app.delete("/api/channels/{channel_id}/instagram")
+def instagram_disconnect(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ch = get_channel_or_404(channel_id, current_user, db)
+    ch.instagram_user_id = None
+    ch.instagram_access_token = None
+    db.commit()
+    return {"success": True}
+
+
 @app.post("/api/channels/{channel_id}/test-instagram")
 def test_instagram_connection(
     channel_id: str,
@@ -676,7 +812,7 @@ def test_instagram_connection(
 
     try:
         resp = requests.get(
-            f"https://graph.facebook.com/v21.0/{user_id}",
+            f"{_ig_api_base(token)}/{user_id}",
             params={"fields": "id,name,username,followers_count", "access_token": token},
             timeout=10,
         )
@@ -905,7 +1041,7 @@ Return only the post text."""
     main_subject = subj_resp.choices[0].message.content.strip()
 
     # Generate image
-    image_url = f"https://placehold.co/1024x1024/4F46E5/FFFFFF?text=PostGen"
+    image_url = ""
     if s.azure_openai_image_endpoint:
         image_prompt = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}. Main subject: {main_subject}"
         if ch.image_generation_prompt:
@@ -1027,8 +1163,9 @@ def publish_post(
     image_url = p.image_path  # blob URL stored directly
 
     try:
+        _api = _ig_api_base(ch.instagram_access_token)
         create_resp = requests.post(
-            f"https://graph.facebook.com/v21.0/{ch.instagram_user_id}/media",
+            f"{_api}/{ch.instagram_user_id}/media",
             params={"image_url": image_url, "caption": p.text, "access_token": ch.instagram_access_token},
             timeout=30,
         )
@@ -1037,9 +1174,23 @@ def publish_post(
             error_msg = create_data.get("error", {}).get("message", create_resp.text)
             raise HTTPException(status_code=502, detail=f"Erro ao criar container: {error_msg}")
 
+        container_id = create_data["id"]
+        for _ in range(15):
+            import time; time.sleep(2)
+            status_resp = requests.get(
+                f"{_api}/{container_id}",
+                params={"fields": "status_code", "access_token": ch.instagram_access_token},
+                timeout=15,
+            )
+            sc = status_resp.json().get("status_code", "")
+            if sc == "FINISHED":
+                break
+            if sc == "ERROR":
+                raise HTTPException(status_code=502, detail="Erro ao processar mídia no Instagram.")
+
         pub_resp = requests.post(
-            f"https://graph.facebook.com/v21.0/{ch.instagram_user_id}/media_publish",
-            params={"creation_id": create_data["id"], "access_token": ch.instagram_access_token},
+            f"{_api}/{ch.instagram_user_id}/media_publish",
+            params={"creation_id": container_id, "access_token": ch.instagram_access_token},
             timeout=30,
         )
         pub_data = pub_resp.json()
@@ -1066,6 +1217,7 @@ def video_to_schema(v: VideoDB) -> SavedVideo:
         channel_id=v.channel_id,
         channel_name=v.channel_name,
         prompt=v.prompt or "",
+        caption=v.caption or "",
         video_path=v.video_path or "",
         duration_seconds=v.duration_seconds or 4,
         size=v.size or "720x1280",
@@ -1111,7 +1263,8 @@ def generate_video(
     if data.additional_prompt:
         prompt += f" {data.additional_prompt}"
 
-    # Create Sora job
+    # Create Sora job (kick off async before generating caption)
+    # Endpoint: POST {AZURE_SORA_ENDPOINT}  (e.g. https://postgen-ai.services.ai.azure.com/openai/v1/videos)
     try:
         create_resp = requests.post(
             AZURE_SORA_ENDPOINT,
@@ -1134,54 +1287,73 @@ def generate_video(
     if not job_id:
         raise HTTPException(status_code=502, detail=f"Resposta inesperada do Sora: {job}")
 
-    # Poll until complete (max 3 minutes)
+    # Generate Instagram caption text while Sora processes (parallel work)
+    caption = ""
+    try:
+        client = get_azure_client(s)
+        text_prompt = ch.text_generation_prompt or f"""Crie uma legenda para um Instagram Reel do canal "{ch.name}".
+Objetivo do canal: {ch.objective}
+Conceito do vídeo: {data.additional_prompt or prompt}
+Escreva uma legenda envolvente com emojis e hashtags relevantes, 80-150 palavras.
+Retorne apenas o texto da legenda."""
+        cap_resp = client.chat.completions.create(
+            model=s.azure_openai_deployment_name,
+            messages=[
+                {"role": "system", "content": "Você é um especialista em conteúdo para Instagram."},
+                {"role": "user", "content": text_prompt},
+            ],
+            max_tokens=400, temperature=0.7,
+        )
+        caption = cap_resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Caption generation failed: {e}")
+
+    # Poll until complete (max 4 minutes)
+    # Poll URL: GET {AZURE_SORA_ENDPOINT}/{job_id}
     poll_url = f"{AZURE_SORA_ENDPOINT}/{job_id}"
-    deadline = datetime.now().timestamp() + 180
-    video_url = None
+    import time
+    deadline = datetime.now().timestamp() + 240
+    completed = False
     while datetime.now().timestamp() < deadline:
-        import time
         time.sleep(5)
         try:
             poll_resp = requests.get(poll_url, headers=_sora_headers(), timeout=15)
             result = poll_resp.json()
-            print(f"Sora poll: {result.get('status', result)}")
+            status = result.get("status", "")
+            print(f"Sora poll: status={status} progress={result.get('progress', '?')}")
         except Exception as e:
             print(f"Sora poll error: {e}")
             continue
 
-        status = result.get("status", "")
-        if status in ("succeeded", "completed", "done"):
-            # Extract video URL from various possible response shapes
-            gens = result.get("generations") or result.get("outputs") or []
-            if gens:
-                video_url = gens[0].get("url") or gens[0].get("video_url")
-            if not video_url:
-                video_url = result.get("url") or result.get("video_url") or result.get("result", {}).get("url")
+        if status == "completed":
+            completed = True
             break
         if status in ("failed", "error", "cancelled"):
-            err = result.get("error", {}).get("message") or result.get("message") or "Job falhou"
-            raise HTTPException(status_code=502, detail=f"Sora falhou: {err}")
+            err_obj = result.get("error") or {}
+            err = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+            raise HTTPException(status_code=502, detail=f"Sora falhou: {err or status}")
 
-    if not video_url:
+    if not completed:
         raise HTTPException(status_code=504, detail="Timeout aguardando o Sora. Tente novamente.")
 
-    # Download video and upload to blob
+    # Download video from content endpoint and upload to blob
+    # Content URL: GET {AZURE_SORA_ENDPOINT}/{job_id}/content
     video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    content_url = f"{AZURE_SORA_ENDPOINT}/{job_id}/content"
     try:
-        dl = requests.get(video_url, timeout=60, stream=True)
+        dl = requests.get(content_url, headers=_sora_headers(), timeout=120, allow_redirects=True)
         dl.raise_for_status()
         video_bytes = dl.content
         blob_url = upload_bytes_to_blob(video_bytes, f"videos/{video_id}.mp4", "video/mp4")
     except Exception as e:
-        # If download fails (expired URL), store the original URL temporarily
-        print(f"Video download failed: {e}. Storing original URL.")
-        blob_url = video_url
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar vídeo Sora: {str(e)}")
 
     v = VideoDB(
         id=video_id,
         channel_id=ch.id,
         channel_name=ch.name,
         prompt=prompt,
+        caption=caption,
         video_path=blob_url,
         duration_seconds=data.seconds,
         size=data.size,
@@ -1210,6 +1382,101 @@ def delete_video(
         raise HTTPException(status_code=404, detail="Vídeo não encontrado")
     db.delete(v)
     db.commit()
+
+
+@app.patch("/api/videos/{video_id}/caption", response_model=SavedVideo)
+def update_video_caption(
+    video_id: str,
+    data: UpdateVideoCaptionRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    v.caption = data.caption
+    db.commit()
+    db.refresh(v)
+    return video_to_schema(v)
+
+
+@app.post("/api/videos/{video_id}/publish", response_model=SavedVideo)
+def publish_video(
+    video_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+
+    ch = db.query(ChannelDB).filter(ChannelDB.id == v.channel_id).first()
+    if not ch.instagram_user_id or not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não configurado para este canal.")
+
+    try:
+        _api = _ig_api_base(ch.instagram_access_token)
+        # Create Reels container
+        create_resp = requests.post(
+            f"{_api}/{ch.instagram_user_id}/media",
+            params={
+                "media_type": "REELS",
+                "video_url": v.video_path,
+                "caption": v.caption or v.prompt,
+                "access_token": ch.instagram_access_token,
+            },
+            timeout=30,
+        )
+        create_data = create_resp.json()
+        if create_resp.status_code != 200 or "id" not in create_data:
+            error_msg = create_data.get("error", {}).get("message", create_resp.text)
+            raise HTTPException(status_code=502, detail=f"Erro ao criar container Reels: {error_msg}")
+
+        # Poll until container is ready (max 2 minutes)
+        import time
+        container_id = create_data["id"]
+        for _ in range(24):
+            time.sleep(5)
+            status_resp = requests.get(
+                f"{_api}/{container_id}",
+                params={"fields": "status_code", "access_token": ch.instagram_access_token},
+                timeout=15,
+            )
+            if status_resp.json().get("status_code") == "FINISHED":
+                break
+
+        # Publish
+        pub_resp = requests.post(
+            f"{_api}/{ch.instagram_user_id}/media_publish",
+            params={"creation_id": container_id, "access_token": ch.instagram_access_token},
+            timeout=30,
+        )
+        pub_data = pub_resp.json()
+        if pub_resp.status_code != 200 or "id" not in pub_data:
+            error_msg = pub_data.get("error", {}).get("message", pub_resp.text)
+            raise HTTPException(status_code=502, detail=f"Erro ao publicar Reel: {error_msg}")
+
+        v.published = True
+        db.commit()
+        db.refresh(v)
+        return video_to_schema(v)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
 
 
 if __name__ == "__main__":
