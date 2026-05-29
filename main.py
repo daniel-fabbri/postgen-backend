@@ -213,7 +213,7 @@ class CreditUsageDB(Base):
     output_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
     credits_consumed = Column(Float, default=0.0)  # Créditos consumidos (calculado)
-    metadata = Column(Text, default="{}")  # JSON com informações adicionais
+    meta_info = Column(Text, default="{}")  # JSON com informações adicionais
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -293,7 +293,7 @@ def on_startup():
                     output_tokens INTEGER DEFAULT 0,
                     total_tokens INTEGER DEFAULT 0,
                     credits_consumed FLOAT DEFAULT 0.0,
-                    metadata TEXT DEFAULT '{}',
+                    meta_info TEXT DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -666,7 +666,7 @@ def register_credit_usage(
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         credits_consumed=credits,
-        metadata=json.dumps(metadata or {}),
+        meta_info=json.dumps(metadata or {}),
     )
     
     db.add(usage)
@@ -3098,7 +3098,7 @@ def get_credits_log(
             output_tokens=record.output_tokens,
             total_tokens=record.total_tokens,
             credits_consumed=record.credits_consumed,
-            metadata=json.loads(record.metadata or "{}"),
+            metadata=json.loads(record.meta_info or "{}"),
             created_at=record.created_at.isoformat(),
         ))
     
