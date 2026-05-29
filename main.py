@@ -326,6 +326,11 @@ class UserOut(BaseModel):
         from_attributes = True
 
 
+class UserUpdate(BaseModel):
+    name: str
+    email: str
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -1069,6 +1074,46 @@ def login(data: UserLogin, db: Session = Depends(get_db)):
 @app.get("/api/auth/me", response_model=UserOut)
 def me(current_user: UserDB = Depends(get_current_user)):
     return UserOut.model_validate(current_user)
+
+
+# ---------------------------------------------------------------------------
+# User endpoints
+# ---------------------------------------------------------------------------
+@app.put("/api/users/profile", response_model=UserOut)
+def update_profile(
+    data: UserUpdate,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Atualiza o perfil do usuário atual"""
+    # Verificar se o email já está em uso por outro usuário
+    if data.email != current_user.email:
+        existing = db.query(UserDB).filter(
+            UserDB.email == data.email,
+            UserDB.id != current_user.id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="E-mail já está em uso")
+    
+    current_user.name = data.name
+    current_user.email = data.email
+    db.commit()
+    db.refresh(current_user)
+    return UserOut.model_validate(current_user)
+
+
+@app.get("/api/admin/users", response_model=list[UserOut])
+def list_all_users(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Lista todos os usuários (apenas para admin)"""
+    # Verificar se é admin
+    if current_user.email != "daniel.fabbri@avanade.com":
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    
+    users = db.query(UserDB).order_by(UserDB.created_at.desc()).all()
+    return [UserOut.model_validate(u) for u in users]
 
 
 # ---------------------------------------------------------------------------
