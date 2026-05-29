@@ -7,13 +7,16 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os
 import base64
+import json
 import shutil
+import subprocess
+import tempfile
 import requests
 from datetime import datetime, timedelta, timezone
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine, Column, String, Text, Boolean, Integer,
+    create_engine, Column, String, Text, Boolean, Integer, Float,
     DateTime, ForeignKey, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
@@ -24,7 +27,7 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
+app = FastAPI(title="PostGen API")
 # Config
 # ---------------------------------------------------------------------------
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8004").rstrip("/")
@@ -46,6 +49,9 @@ AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "images")
 
 AZURE_SORA_ENDPOINT = os.getenv("AZURE_SORA_ENDPOINT", "").rstrip("/")
 AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
+
+GPT_IMAGE_2_ENDPOINT = os.getenv("GPT_IMAGE_2_ENDPOINT", "https://postgen-ai.openai.azure.com").rstrip("/")
+GPT_IMAGE_2_API_KEY = os.getenv("GPT_IMAGE_2_API_KEY", "")
 
 INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
 INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
@@ -82,11 +88,13 @@ class ChannelDB(Base):
     suggested_image_url = Column(Text, nullable=True)
     instagram_user_id = Column(String(255), nullable=True)
     instagram_access_token = Column(Text, nullable=True)
+    image_model = Column(String(20), default="mai")   # "mai" | "gpt-image-2"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user = relationship("UserDB", back_populates="channels")
     posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
     videos = relationship("VideoDB", back_populates="channel", cascade="all, delete-orphan")
     avatars = relationship("AvatarDB", back_populates="channel")
+    reference_images = relationship("ReferenceImageDB", back_populates="channel", cascade="all, delete-orphan")
 
 
 class PostDB(Base):
@@ -96,7 +104,10 @@ class PostDB(Base):
     channel_name = Column(String(255), nullable=False)
     text = Column(Text, default="")
     image_path = Column(Text, default="")
+    prompt = Column(Text, nullable=True)
+    ig_media_id = Column(String(100), nullable=True)
     published = Column(Boolean, default=False)
+    credits_consumed = Column(Float, default=0.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     channel = relationship("ChannelDB", back_populates="posts")
 
@@ -113,7 +124,56 @@ class VideoDB(Base):
     size = Column(String(20), default="720x1280")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     published = Column(Boolean, default=False)
+    is_project_clip = Column(Boolean, default=False)
+    ig_media_id = Column(String(100), nullable=True)
+    credits_consumed = Column(Float, default=0.0)
     channel = relationship("ChannelDB", back_populates="videos")
+
+
+class VideoProjectDB(Base):
+    __tablename__ = "video_projects"
+    id = Column(String(100), primary_key=True)
+    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String(255), default="")
+    clip_ids = Column(Text, default="[]")
+    clip_urls = Column(Text, default="{}")  # {video_id: original_url} — never overwritten by exports
+    root_video_id = Column(String(100), nullable=True)
+    exported_video_id = Column(String(100), nullable=True)  # the compiled result in the feed
+    exported_path = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MediaInsightsDB(Base):
+    __tablename__ = "media_insights"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    media_type = Column(String(10), nullable=False)   # "post" | "video"
+    media_id = Column(String(100), nullable=False, index=True)
+    ig_media_id = Column(String(100), nullable=False)
+    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    like_count = Column(Integer, default=0)
+    comments_count = Column(Integer, default=0)
+    impressions = Column(Integer, nullable=True)
+    reach = Column(Integer, nullable=True)
+    saved = Column(Integer, nullable=True)
+    shares = Column(Integer, nullable=True)
+    video_views = Column(Integer, nullable=True)
+    total_interactions = Column(Integer, default=0)
+    engagement_rate = Column(Float, nullable=True)   # (interactions / reach) * 100
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReferenceImageDB(Base):
+    __tablename__ = "reference_images"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    blob_url = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)   # Auto-extracted via vision model
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    channel = relationship("ChannelDB", back_populates="reference_images")
 
 
 class AvatarDB(Base):
@@ -138,6 +198,23 @@ class SettingsDB(Base):
     public_base_url = Column(Text, default="http://localhost:8004")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user = relationship("UserDB", back_populates="settings")
+
+
+class CreditUsageDB(Base):
+    __tablename__ = "credit_usage"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=True)
+    resource_type = Column(String(20), nullable=False)  # "post" | "video" | "avatar" | "image"
+    resource_id = Column(String(100), nullable=True)  # ID do post/vídeo/avatar gerado
+    operation_type = Column(String(30), nullable=False)  # "text_generation" | "image_generation" | "video_generation" | "tts"
+    model_name = Column(String(100), nullable=False)  # Nome do modelo usado
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    credits_consumed = Column(Float, default=0.0)  # Créditos consumidos (calculado)
+    metadata = Column(Text, default="{}")  # JSON com informações adicionais
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +257,46 @@ def upload_file_to_blob(file_path: str, blob_name: str, content_type: str = "ima
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
-    # Add caption column to videos if missing (safe migration)
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT ''"))
+            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS is_project_clip BOOLEAN DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS prompt TEXT"))
+            conn.execute(text("ALTER TABLE video_projects ADD COLUMN IF NOT EXISTS root_video_id VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE video_projects ADD COLUMN IF NOT EXISTS clip_urls TEXT DEFAULT '{}'"))
+            conn.execute(text("ALTER TABLE video_projects ADD COLUMN IF NOT EXISTS exported_video_id VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS image_model VARCHAR(20) DEFAULT 'mai'"))
+            conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS ig_media_id VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS ig_media_id VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS credits_consumed FLOAT DEFAULT 0.0"))
+            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS credits_consumed FLOAT DEFAULT 0.0"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS reference_images (
+                    id SERIAL PRIMARY KEY,
+                    channel_id VARCHAR(50) REFERENCES channels(id) ON DELETE CASCADE,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    blob_url TEXT NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS credit_usage (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    channel_id VARCHAR(50) REFERENCES channels(id) ON DELETE CASCADE,
+                    resource_type VARCHAR(20) NOT NULL,
+                    resource_id VARCHAR(100),
+                    operation_type VARCHAR(30) NOT NULL,
+                    model_name VARCHAR(100) NOT NULL,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0,
+                    credits_consumed FLOAT DEFAULT 0.0,
+                    metadata TEXT DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
             conn.commit()
     except Exception:
         pass
@@ -243,6 +356,7 @@ class Channel(BaseModel):
     created_at: Optional[str] = None
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
+    image_model: Optional[str] = "mai"
 
     class Config:
         from_attributes = True
@@ -259,12 +373,56 @@ class Post(BaseModel):
     image_url: str
 
 
+class InsightsOut(BaseModel):
+    like_count: int = 0
+    comments_count: int = 0
+    impressions: Optional[int] = None
+    reach: Optional[int] = None
+    saved: Optional[int] = None
+    shares: Optional[int] = None
+    video_views: Optional[int] = None
+    total_interactions: int = 0
+    engagement_rate: Optional[float] = None
+    fetched_at: Optional[str] = None
+
+
+class DashboardItemOut(BaseModel):
+    media_type: str
+    media_id: str
+    preview_url: str
+    text_preview: str
+    created_at: str
+    published: bool
+    insights: InsightsOut
+
+
+class ChannelDashboardOut(BaseModel):
+    channel_id: str
+    channel_name: str
+    published_count: int
+    total_reach: int
+    total_impressions: int
+    total_interactions: int
+    total_likes: int
+    total_comments: int
+    avg_engagement_rate: Optional[float]
+    top_by_reach: List[DashboardItemOut]
+    top_by_engagement: List[DashboardItemOut]
+    top_by_likes: List[DashboardItemOut]
+    top_by_comments: List[DashboardItemOut]
+    last_refreshed: Optional[str]
+
+
 class SavedPost(BaseModel):
     id: str
     channel_id: str
     channel_name: str
     text: str
     image_path: str
+    prompt: Optional[str] = None
+    ig_media_id: Optional[str] = None
+    insights: Optional[InsightsOut] = None
+    credits_consumed: float = 0.0
     created_at: str
     published: bool = False
 
@@ -302,8 +460,13 @@ class SavedVideo(BaseModel):
     video_path: str
     duration_seconds: int
     size: str
+    credits_consumed: float = 0.0
     created_at: str
     published: bool = False
+    is_project_clip: bool = False
+    video_project_id: Optional[str] = None
+    ig_media_id: Optional[str] = None
+    insights: Optional[InsightsOut] = None
 
     class Config:
         from_attributes = True
@@ -311,6 +474,49 @@ class SavedVideo(BaseModel):
 
 class UpdateVideoCaptionRequest(BaseModel):
     caption: str
+
+
+class VideoProjectOut(BaseModel):
+    id: str
+    channel_id: str
+    title: str
+    clips: List[SavedVideo]
+    exported_path: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class CreateVideoProjectRequest(BaseModel):
+    channel_id: str
+    video_id: str
+
+
+class UpdateVideoProjectClipsRequest(BaseModel):
+    clip_ids: List[str]
+
+
+class GenerateProjectClipRequest(BaseModel):
+    additional_prompt: Optional[str] = None
+    seconds: int = 4
+    size: str = "720x1280"
+
+
+class AddVideoToProjectRequest(BaseModel):
+    video_id: str
+
+
+class ReferenceImageOut(BaseModel):
+    id: int
+    channel_id: str
+    blob_url: str
+    description: Optional[str] = None
+    created_at: str
+
+    class Config:
+        from_attributes = True
 
 
 class AvatarInfo(BaseModel):
@@ -328,6 +534,145 @@ class UpdatePostRequest(BaseModel):
 class GeneratePostImageRequest(BaseModel):
     prompt: str
     channel_id: str
+
+
+class CreditUsageOut(BaseModel):
+    id: int
+    user_id: int
+    channel_id: Optional[str] = None
+    channel_name: Optional[str] = None
+    resource_type: str
+    resource_id: Optional[str] = None
+    operation_type: str
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    credits_consumed: float
+    metadata: dict
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# Credit tracking utilities
+# ---------------------------------------------------------------------------
+
+# Tabela de custos aproximados por 1000 tokens (em créditos)
+# Baseado nos preços da Azure OpenAI e outros serviços
+CREDIT_COSTS = {
+    # Modelos de texto
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "gpt-4": {"input": 30.0, "output": 60.0},
+    "gpt-35-turbo": {"input": 0.5, "output": 1.5},
+    
+    # Modelos de imagem (custo por imagem)
+    "dall-e-3": {"per_image": 40.0},
+    "dall-e-2": {"per_image": 20.0},
+    "mai": {"per_image": 30.0},  # MAI Image 2e
+    "gpt-image-2": {"per_image": 35.0},
+    
+    # Modelos de vídeo (custo por segundo)
+    "sora-2": {"per_second": 50.0},
+    
+    # TTS (custo por 1000 caracteres)
+    "tts": {"per_1k_chars": 15.0},
+}
+
+
+def calculate_credits(
+    operation_type: str,
+    model_name: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    images_count: int = 0,
+    video_seconds: int = 0,
+    text_length: int = 0,
+) -> float:
+    """
+    Calcula créditos consumidos baseado na operação e modelo usado.
+    """
+    credits = 0.0
+    
+    # Normalizar nome do modelo
+    model_key = model_name.lower()
+    for key in CREDIT_COSTS.keys():
+        if key in model_key:
+            model_key = key
+            break
+    
+    if model_key not in CREDIT_COSTS:
+        model_key = "gpt-4o-mini"  # fallback
+    
+    costs = CREDIT_COSTS[model_key]
+    
+    if operation_type == "text_generation":
+        credits = (input_tokens / 1000.0 * costs.get("input", 0)) + \
+                  (output_tokens / 1000.0 * costs.get("output", 0))
+    
+    elif operation_type == "image_generation":
+        credits = images_count * costs.get("per_image", 30.0)
+    
+    elif operation_type == "video_generation":
+        credits = video_seconds * costs.get("per_second", 50.0)
+    
+    elif operation_type == "tts":
+        credits = (text_length / 1000.0) * costs.get("per_1k_chars", 15.0)
+    
+    return round(credits, 4)
+
+
+def register_credit_usage(
+    db: Session,
+    user_id: int,
+    channel_id: Optional[str],
+    resource_type: str,
+    resource_id: Optional[str],
+    operation_type: str,
+    model_name: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    images_count: int = 0,
+    video_seconds: int = 0,
+    text_length: int = 0,
+    metadata: dict = None,
+) -> float:
+    """
+    Registra uso de créditos no banco de dados e retorna o valor consumido.
+    """
+    total_tokens = input_tokens + output_tokens
+    
+    credits = calculate_credits(
+        operation_type=operation_type,
+        model_name=model_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        images_count=images_count,
+        video_seconds=video_seconds,
+        text_length=text_length,
+    )
+    
+    usage = CreditUsageDB(
+        user_id=user_id,
+        channel_id=channel_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        operation_type=operation_type,
+        model_name=model_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        credits_consumed=credits,
+        metadata=json.dumps(metadata or {}),
+    )
+    
+    db.add(usage)
+    db.commit()
+    
+    return credits
 
 
 # ---------------------------------------------------------------------------
@@ -439,12 +784,225 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
         created_at=ch.created_at.isoformat() if ch.created_at else None,
         instagram_user_id=ch.instagram_user_id,
         instagram_access_token="***" if ch.instagram_access_token else None,
+        image_model=ch.image_model or "mai",
     )
 
 
-def post_to_schema(p: PostDB) -> SavedPost:
+def _generate_image_bytes(
+    prompt: str, ch: Optional["ChannelDB"], s: "SettingsDB", db: Session,
+    width: int = 1024, height: int = 1024,
+) -> bytes:
+    """Route image generation to the correct model for the channel. Falls back to MAI if ch is None."""
+    model = (ch.image_model or "mai") if ch else "mai"
+
+    if model == "gpt-image-2":
+        if not GPT_IMAGE_2_API_KEY:
+            raise HTTPException(status_code=400, detail="GPT_IMAGE_2_API_KEY não configurado no servidor")
+        from openai import AzureOpenAI as _AzOAI
+        import io as _io
+        img_client = _AzOAI(
+            azure_endpoint=GPT_IMAGE_2_ENDPOINT,
+            api_key=GPT_IMAGE_2_API_KEY,
+            api_version="2025-04-01-preview",
+        )
+        # Use images.edit with reference if available, else plain generate
+        refs = db.query(ReferenceImageDB).filter(
+            ReferenceImageDB.channel_id == ch.id,
+        ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+
+        if refs:
+            try:
+                ref_bytes = requests.get(refs[0].blob_url, timeout=20).content
+                size_str = f"{width}x{height}" if width == height else "1024x1024"
+                result = img_client.images.edit(
+                    model="gpt-image-2",
+                    image=("reference.jpg", _io.BytesIO(ref_bytes), "image/jpeg"),
+                    prompt=prompt,
+                    n=1,
+                    size=size_str,
+                )
+                return base64.b64decode(result.data[0].b64_json)
+            except Exception as e:
+                print(f"gpt-image-2 edit failed, falling back to generate: {e}")
+
+        result = img_client.images.generate(
+            model="gpt-image-2",
+            prompt=prompt,
+            n=1,
+            size="1024x1024",
+        )
+        # Azure AI Foundry returns b64_json by default (no response_format param needed)
+        return base64.b64decode(result.data[0].b64_json)
+
+    else:  # MAI
+        if not s.azure_openai_image_endpoint:
+            raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
+        resp = requests.post(
+            s.azure_openai_image_endpoint,
+            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
+            json={"prompt": prompt, "width": width, "height": height, "model": s.azure_openai_image_deployment},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if not result.get("data") or "b64_json" not in result["data"][0]:
+            raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
+        return base64.b64decode(result["data"][0]["b64_json"])
+
+
+def _get_reference_context(channel_id: str, db: Session) -> str:
+    """Return a visual reference description string to inject into image prompts."""
+    refs = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.channel_id == channel_id,
+        ReferenceImageDB.description.isnot(None),
+    ).order_by(ReferenceImageDB.created_at.desc()).limit(3).all()
+    if not refs:
+        return ""
+    descriptions = [r.description for r in refs if r.description]
+    if not descriptions:
+        return ""
+    return "\n\nVisual reference for the person/character in this image: " + " ".join(descriptions)
+
+
+def _insights_to_schema(ins) -> Optional[InsightsOut]:
+    if not ins:
+        return None
+    return InsightsOut(
+        like_count=ins.like_count or 0,
+        comments_count=ins.comments_count or 0,
+        impressions=ins.impressions,
+        reach=ins.reach,
+        saved=ins.saved,
+        shares=ins.shares,
+        video_views=ins.video_views,
+        total_interactions=ins.total_interactions or 0,
+        engagement_rate=ins.engagement_rate,
+        fetched_at=ins.fetched_at.isoformat() if ins.fetched_at else None,
+    )
+
+
+def _insights_ttl(published_at: datetime) -> timedelta:
+    now = datetime.now(timezone.utc)
+    if published_at:
+        pub = published_at.replace(tzinfo=timezone.utc) if not published_at.tzinfo else published_at
+        age = now - pub
+    else:
+        age = timedelta(days=999)
+    if age < timedelta(days=1):
+        return timedelta(minutes=30)
+    elif age < timedelta(days=7):
+        return timedelta(hours=2)
+    elif age < timedelta(days=30):
+        return timedelta(hours=12)
+    return timedelta(days=1)
+
+
+def _insights_stale(ins, published_at: datetime) -> bool:
+    if not ins or not ins.fetched_at:
+        return True
+    ttl = _insights_ttl(published_at)
+    now = datetime.now(timezone.utc)
+    fetched = ins.fetched_at.replace(tzinfo=timezone.utc) if not ins.fetched_at.tzinfo else ins.fetched_at
+    return (now - fetched) > ttl
+
+
+def _fetch_and_store_insights(
+    media_type: str, media_id: str, ig_media_id: str,
+    channel_id: str, token: str, db: Session,
+):
+    result = {}
+    ig_media_type = None
+    api_base = _ig_api_base(token)
+
+    try:
+        resp = requests.get(
+            f"{api_base}/{ig_media_id}",
+            params={"fields": "like_count,comments_count,media_type", "access_token": token},
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            result["like_count"] = data.get("like_count", 0)
+            result["comments_count"] = data.get("comments_count", 0)
+            ig_media_type = data.get("media_type", "")
+        else:
+            print(f"Insights basic fetch failed {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"Insights basic fetch error: {e}")
+
+    metrics = ["impressions", "reach", "saved", "shares"]
+    if ig_media_type in ("VIDEO", "REELS"):
+        metrics += ["video_views", "plays"]
+    try:
+        ins_resp = requests.get(
+            f"{api_base}/{ig_media_id}/insights",
+            params={"metric": ",".join(metrics), "period": "lifetime", "access_token": token},
+            timeout=15,
+        )
+        if ins_resp.ok:
+            for item in ins_resp.json().get("data", []):
+                name = item.get("name", "")
+                val = item.get("value")
+                if val is None:
+                    vals = item.get("values", [])
+                    val = vals[0].get("value", 0) if vals else 0
+                if val is None:
+                    total = item.get("total_value", {})
+                    val = total.get("value", 0) if isinstance(total, dict) else 0
+                result[name] = val or 0
+        else:
+            print(f"Insights advanced fetch failed {ins_resp.status_code}: {ins_resp.text[:200]}")
+    except Exception as e:
+        print(f"Insights advanced fetch skipped: {e}")
+
+    interactions = (result.get("like_count", 0) + result.get("comments_count", 0) + result.get("saved", 0))
+    result["total_interactions"] = interactions
+    reach = result.get("reach")
+    result["engagement_rate"] = round(interactions / reach * 100, 2) if reach else None
+
+    now = datetime.now(timezone.utc)
+    ins = db.query(MediaInsightsDB).filter(
+        MediaInsightsDB.media_type == media_type,
+        MediaInsightsDB.media_id == media_id,
+    ).first()
+
+    if ins:
+        ins.like_count = result.get("like_count", 0)
+        ins.comments_count = result.get("comments_count", 0)
+        ins.impressions = result.get("impressions")
+        ins.reach = result.get("reach")
+        ins.saved = result.get("saved")
+        ins.shares = result.get("shares")
+        ins.video_views = result.get("video_views")
+        ins.total_interactions = result.get("total_interactions", 0)
+        ins.engagement_rate = result.get("engagement_rate")
+        ins.fetched_at = now
+    else:
+        ins = MediaInsightsDB(
+            media_type=media_type,
+            media_id=media_id,
+            ig_media_id=ig_media_id,
+            channel_id=channel_id,
+            like_count=result.get("like_count", 0),
+            comments_count=result.get("comments_count", 0),
+            impressions=result.get("impressions"),
+            reach=result.get("reach"),
+            saved=result.get("saved"),
+            shares=result.get("shares"),
+            video_views=result.get("video_views"),
+            total_interactions=result.get("total_interactions", 0),
+            engagement_rate=result.get("engagement_rate"),
+            fetched_at=now,
+        )
+        db.add(ins)
+
+    db.commit()
+    db.refresh(ins)
+    return ins
+
+
+def post_to_schema(p: PostDB, insights=None) -> SavedPost:
     image_path = p.image_path or ""
-    # Don't send base64 blobs over the wire — they bloat responses and cause network errors
     if image_path.startswith("data:"):
         image_path = ""
     return SavedPost(
@@ -453,6 +1011,10 @@ def post_to_schema(p: PostDB) -> SavedPost:
         channel_name=p.channel_name,
         text=p.text or "",
         image_path=image_path,
+        prompt=getattr(p, "prompt", None),
+        ig_media_id=getattr(p, "ig_media_id", None),
+        insights=_insights_to_schema(insights),
+        credits_consumed=getattr(p, "credits_consumed", 0.0),
         created_at=p.created_at.isoformat() if p.created_at else datetime.now().isoformat(),
         published=p.published or False,
     )
@@ -598,26 +1160,17 @@ def create_channel(
     if ch.image_generation_prompt:
         try:
             s = get_or_create_settings(current_user, db)
-            if s.azure_openai_image_endpoint:
-                avatar_prompt = (
-                    "\n".join(ch.image_generation_prompt.splitlines()[:5])
-                    + "\n\nFrame: Close-up portrait style, profile picture format."
-                )
-                resp = requests.post(
-                    s.azure_openai_image_endpoint,
-                    headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-                    json={"prompt": avatar_prompt, "width": 768, "height": 768, "model": s.azure_openai_image_deployment},
-                )
-                if resp.status_code == 200:
-                    result = resp.json()
-                    if result.get("data") and "b64_json" in result["data"][0]:
-                        avatar_filename = f"{ch.id}.png"
-                        image_bytes = base64.b64decode(result["data"][0]["b64_json"])
-                        avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
-                        ch.avatar_url = avatar_url
-                        _register_avatar(avatar_filename, ch.id, db)
-                        db.commit()
-                        db.refresh(ch)
+            avatar_prompt = (
+                "\n".join(ch.image_generation_prompt.splitlines()[:5])
+                + "\n\nFrame: Close-up portrait style, profile picture format."
+            )
+            image_bytes = _generate_image_bytes(avatar_prompt, ch, s, db, width=768, height=768)
+            avatar_filename = f"{ch.id}.png"
+            avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
+            ch.avatar_url = avatar_url
+            _register_avatar(avatar_filename, ch.id, db)
+            db.commit()
+            db.refresh(ch)
         except Exception as e:
             print(f"Error generating avatar: {e}")
 
@@ -650,6 +1203,8 @@ def update_channel(
     ch.instagram_user_id = data.instagram_user_id
     if data.instagram_access_token and data.instagram_access_token != "***":
         ch.instagram_access_token = data.instagram_access_token
+    if data.image_model:
+        ch.image_model = data.image_model
     db.commit()
     db.refresh(ch)
     return channel_to_schema(ch)
@@ -707,7 +1262,7 @@ def instagram_authorize(
     params = {
         "client_id": INSTAGRAM_APP_ID,
         "redirect_uri": f"{BASE_URL}/api/auth/instagram/callback",
-        "scope": "instagram_business_basic,instagram_business_content_publish",
+        "scope": "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights",
         "response_type": "code",
         "state": state,
     }
@@ -886,10 +1441,8 @@ def generate_avatar(
     db: Session = Depends(get_db),
 ):
     s = get_or_create_settings(current_user, db)
-    if not s.azure_openai_image_endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
-    # Use channel's image_generation_prompt (first 5 lines) as visual identity base
+    ch = None
     channel_prompt = ""
     if data.channel_id:
         ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
@@ -902,33 +1455,43 @@ def generate_avatar(
     else:
         full_prompt = (channel_prompt or data.prompt) + portrait_suffix
 
+    if ch:
+        full_prompt += _get_reference_context(ch.id, db)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     avatar_filename = f"avatar_{timestamp}.png"
 
-    def _call_avatar_api(prompt: str):
-        return requests.post(
-            s.azure_openai_image_endpoint,
-            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "width": 768, "height": 768, "model": s.azure_openai_image_deployment},
-        )
+    try:
+        image_bytes = _generate_image_bytes(full_prompt, ch, s, db, width=768, height=768)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if data.prompt and channel_prompt:
+            try:
+                fallback = data.prompt + portrait_suffix + (_get_reference_context(ch.id, db) if ch else "")
+                image_bytes = _generate_image_bytes(fallback, ch, s, db, width=768, height=768)
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {str(e2)}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {str(e)}")
 
-    resp = _call_avatar_api(full_prompt)
-    if resp.status_code != 200:
-        err_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        err_code = err_body.get("error", {}).get("code", "") if isinstance(err_body.get("error"), dict) else ""
-        if err_code == "content_safety_violation" and data.prompt and channel_prompt:
-            resp = _call_avatar_api(data.prompt + portrait_suffix)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {resp.text}")
-
-    result = resp.json()
-    if not result.get("data") or "b64_json" not in result["data"][0]:
-        raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-
-    image_bytes = base64.b64decode(result["data"][0]["b64_json"])
     avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
+    
+    # Track avatar generation credits
+    image_model = ch.image_model if ch else "mai"
+    register_credit_usage(
+        db=db,
+        user_id=current_user.id,
+        channel_id=data.channel_id,
+        resource_type="avatar",
+        resource_id=avatar_filename,
+        operation_type="image_generation",
+        model_name=image_model,
+        images_count=1,
+        metadata={"prompt_length": len(full_prompt), "size": "768x768"},
+    )
 
-    if data.channel_id:
+    if data.channel_id and ch:
         ch = get_channel_or_404(data.channel_id, current_user, db)
         _register_avatar(avatar_filename, data.channel_id, db)
         ch.avatar_url = avatar_url
@@ -980,7 +1543,15 @@ def get_posts(
         .order_by(PostDB.created_at.desc())
         .all()
     )
-    return [post_to_schema(p) for p in posts]
+    post_ids = [p.id for p in posts]
+    ins_map = {}
+    if post_ids:
+        for ins in db.query(MediaInsightsDB).filter(
+            MediaInsightsDB.media_type == "post",
+            MediaInsightsDB.media_id.in_(post_ids),
+        ).all():
+            ins_map[ins.media_id] = ins
+    return [post_to_schema(p, ins_map.get(p.id)) for p in posts]
 
 
 @app.get("/api/posts/{post_id}", response_model=SavedPost)
@@ -1053,6 +1624,21 @@ Return only the post text."""
         max_tokens=500, temperature=0.7,
     )
     post_text = text_resp.choices[0].message.content.strip()
+    
+    # Track text generation credits
+    text_usage = text_resp.usage
+    total_credits = register_credit_usage(
+        db=db,
+        user_id=current_user.id,
+        channel_id=ch.id,
+        resource_type="post",
+        resource_id=None,  # Will be updated later
+        operation_type="text_generation",
+        model_name=s.azure_openai_deployment_name,
+        input_tokens=text_usage.prompt_tokens,
+        output_tokens=text_usage.completion_tokens,
+        metadata={"step": "post_text_generation"},
+    )
 
     # Extract main subject for image consistency
     subj_resp = client.chat.completions.create(
@@ -1064,40 +1650,54 @@ Return only the post text."""
         max_tokens=20, temperature=0.3,
     )
     main_subject = subj_resp.choices[0].message.content.strip()
+    
+    # Track subject extraction credits
+    subj_usage = subj_resp.usage
+    total_credits += register_credit_usage(
+        db=db,
+        user_id=current_user.id,
+        channel_id=ch.id,
+        resource_type="post",
+        resource_id=None,
+        operation_type="text_generation",
+        model_name=s.azure_openai_deployment_name,
+        input_tokens=subj_usage.prompt_tokens,
+        output_tokens=subj_usage.completion_tokens,
+        metadata={"step": "subject_extraction"},
+    )
 
     # Generate image
-    image_url = ""
-    if s.azure_openai_image_endpoint:
+    image_prompt = None
+    post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    blob_url = ""
+    model_ready = s.azure_openai_image_endpoint or (ch.image_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
+    if model_ready:
         image_prompt = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}. Main subject: {main_subject}"
         if ch.image_generation_prompt:
             image_prompt += f"\n\nItem específico: {main_subject}"
         if data.additional_prompt:
             image_prompt += f"\n\n{data.additional_prompt}"
+        image_prompt += _get_reference_context(ch.id, db)
         try:
-            img_resp = requests.post(
-                s.azure_openai_image_endpoint,
-                headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-                json={"prompt": image_prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
-                timeout=60,
+            img_bytes = _generate_image_bytes(image_prompt, ch, s, db)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
+            
+            # Track image generation credits
+            image_model = ch.image_model or "mai"
+            total_credits += register_credit_usage(
+                db=db,
+                user_id=current_user.id,
+                channel_id=ch.id,
+                resource_type="post",
+                resource_id=post_id,
+                operation_type="image_generation",
+                model_name=image_model,
+                images_count=1,
+                metadata={"prompt_length": len(image_prompt)},
             )
-            img_resp.raise_for_status()
-            img_result = img_resp.json()
-            if img_result.get("data") and "b64_json" in img_result["data"][0]:
-                image_url = f"data:image/png;base64,{img_result['data'][0]['b64_json']}"
         except Exception as e:
             print(f"Image generation failed: {e}")
-
-    # Save post — upload image to blob, store blob URL
-    post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    blob_url = ""
-    if image_url.startswith("data:image"):
-        try:
-            blob_url = save_image_from_base64(image_url, post_id)
-        except Exception as e:
-            print(f"Error uploading image to blob: {e}")
-            blob_url = image_url  # fallback: keep base64
-    else:
-        blob_url = image_url
 
     p = PostDB(
         id=post_id,
@@ -1105,9 +1705,18 @@ Return only the post text."""
         channel_name=ch.name,
         text=post_text,
         image_path=blob_url,
+        prompt=image_prompt,
         published=False,
+        credits_consumed=total_credits,
     )
     db.add(p)
+    db.commit()
+    
+    # Update resource_id in credit_usage records
+    db.execute(
+        text("UPDATE credit_usage SET resource_id = :post_id WHERE resource_id IS NULL AND user_id = :user_id AND channel_id = :channel_id"),
+        {"post_id": post_id, "user_id": current_user.id, "channel_id": ch.id}
+    )
     db.commit()
 
     return Post(id=post_id, text=post_text, image_url=blob_url)
@@ -1155,32 +1764,44 @@ def generate_post_image(
         full_prompt = f"{channel_prompt}\n\n{data.prompt}"
     else:
         full_prompt = channel_prompt or data.prompt
+    if ch:
+        full_prompt += _get_reference_context(ch.id, db)
 
-    def _call_image_api(prompt: str):
-        return requests.post(
-            s.azure_openai_image_endpoint,
-            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "width": 1024, "height": 1024, "model": s.azure_openai_image_deployment},
-            timeout=60,
-        )
+    try:
+        img_bytes = _generate_image_bytes(full_prompt, ch, s, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Content safety fallback: retry with user prompt only
+        if data.prompt and channel_prompt:
+            try:
+                fallback_prompt = data.prompt + (f"\n\n{_get_reference_context(ch.id, db)}" if ch else "")
+                img_bytes = _generate_image_bytes(fallback_prompt, ch, s, db)
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {str(e2)}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {str(e)}")
 
-    resp = _call_image_api(full_prompt)
-    if resp.status_code != 200:
-        err_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        err_code = err_body.get("error", {}).get("code", "") if isinstance(err_body.get("error"), dict) else ""
-        # If combined prompt triggers content safety, retry with user prompt only
-        if err_code == "content_safety_violation" and data.prompt and channel_prompt:
-            print(f"Content safety on combined prompt, retrying with user-only prompt")
-            resp = _call_image_api(data.prompt)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {resp.text}")
-
-    result = resp.json()
-    if not result.get("data") or "b64_json" not in result["data"][0]:
-        raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-
-    blob_url = save_image_from_base64(result["data"][0]["b64_json"], post_id)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
     p.image_path = blob_url
+    p.prompt = full_prompt
+    
+    # Track image generation credits and add to post total
+    image_model = ch.image_model if ch else "mai"
+    credits = register_credit_usage(
+        db=db,
+        user_id=current_user.id,
+        channel_id=ch.id if ch else None,
+        resource_type="post",
+        resource_id=post_id,
+        operation_type="image_generation",
+        model_name=image_model,
+        images_count=1,
+        metadata={"prompt_length": len(full_prompt), "regenerated": True},
+    )
+    
+    p.credits_consumed = (p.credits_consumed or 0.0) + credits
     db.commit()
     return {
         "success": True,
@@ -1243,6 +1864,7 @@ def publish_post(
             raise HTTPException(status_code=502, detail=f"Erro ao publicar: {error_msg}")
 
         p.published = True
+        p.ig_media_id = pub_data["id"]
         db.commit()
         return {"success": True, "instagram_post_id": pub_data["id"]}
 
@@ -1255,7 +1877,7 @@ def publish_post(
 # ---------------------------------------------------------------------------
 # Videos endpoints
 # ---------------------------------------------------------------------------
-def video_to_schema(v: VideoDB) -> SavedVideo:
+def video_to_schema(v: VideoDB, video_project_id: str = None, insights=None) -> SavedVideo:
     return SavedVideo(
         id=v.id,
         channel_id=v.channel_id,
@@ -1265,8 +1887,13 @@ def video_to_schema(v: VideoDB) -> SavedVideo:
         video_path=v.video_path or "",
         duration_seconds=v.duration_seconds or 4,
         size=v.size or "720x1280",
+        credits_consumed=getattr(v, "credits_consumed", 0.0),
         created_at=v.created_at.isoformat() if v.created_at else datetime.now().isoformat(),
         published=v.published or False,
+        is_project_clip=v.is_project_clip or False,
+        video_project_id=video_project_id,
+        ig_media_id=getattr(v, "ig_media_id", None),
+        insights=_insights_to_schema(insights),
     )
 
 
@@ -1283,10 +1910,35 @@ def get_videos(
     user_channel_ids = [
         ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
     ]
-    q = db.query(VideoDB).filter(VideoDB.channel_id.in_(user_channel_ids))
+    q = db.query(VideoDB).filter(
+        VideoDB.channel_id.in_(user_channel_ids),
+        VideoDB.is_project_clip.is_not(True),
+    )
     if channel_id:
         q = q.filter(VideoDB.channel_id == channel_id)
-    return [video_to_schema(v) for v in q.order_by(VideoDB.created_at.desc()).all()]
+    videos = q.order_by(VideoDB.created_at.desc()).all()
+
+    # Batch-lookup which videos are roots/exports of an existing project
+    video_ids = [v.id for v in videos]
+    project_map = {}
+    if video_ids:
+        for vp in db.query(VideoProjectDB.id, VideoProjectDB.root_video_id, VideoProjectDB.exported_video_id).filter(
+            (VideoProjectDB.root_video_id.in_(video_ids)) | (VideoProjectDB.exported_video_id.in_(video_ids))
+        ).all():
+            if vp.root_video_id:
+                project_map[vp.root_video_id] = vp.id
+            if vp.exported_video_id:
+                project_map[vp.exported_video_id] = vp.id
+
+    ins_map = {}
+    if video_ids:
+        for ins in db.query(MediaInsightsDB).filter(
+            MediaInsightsDB.media_type == "video",
+            MediaInsightsDB.media_id.in_(video_ids),
+        ).all():
+            ins_map[ins.media_id] = ins
+
+    return [video_to_schema(v, project_map.get(v.id), ins_map.get(v.id)) for v in videos]
 
 
 @app.post("/api/videos/generate", response_model=SavedVideo)
@@ -1339,6 +1991,7 @@ def generate_video(
 
     # Generate Instagram caption text while Sora processes (parallel work)
     caption = ""
+    total_credits = 0.0
     try:
         client = get_azure_client(s)
         text_prompt = ch.text_generation_prompt or f"""Crie uma legenda para um Instagram Reel do canal "{ch.name}".
@@ -1355,6 +2008,21 @@ Retorne apenas o texto da legenda."""
             max_tokens=400, temperature=0.7,
         )
         caption = cap_resp.choices[0].message.content.strip()
+        
+        # Track caption generation credits
+        cap_usage = cap_resp.usage
+        total_credits += register_credit_usage(
+            db=db,
+            user_id=current_user.id,
+            channel_id=ch.id,
+            resource_type="video",
+            resource_id=None,  # Will be updated later
+            operation_type="text_generation",
+            model_name=s.azure_openai_deployment_name,
+            input_tokens=cap_usage.prompt_tokens,
+            output_tokens=cap_usage.completion_tokens,
+            metadata={"step": "video_caption_generation"},
+        )
     except Exception as e:
         print(f"Caption generation failed: {e}")
 
@@ -1398,6 +2066,21 @@ Retorne apenas o texto da legenda."""
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Falha ao baixar vídeo Sora: {str(e)}")
 
+    video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    
+    # Track video generation credits
+    total_credits += register_credit_usage(
+        db=db,
+        user_id=current_user.id,
+        channel_id=ch.id,
+        resource_type="video",
+        resource_id=video_id,
+        operation_type="video_generation",
+        model_name="sora-2",
+        video_seconds=data.seconds,
+        metadata={"prompt_length": len(prompt), "size": data.size},
+    )
+
     v = VideoDB(
         id=video_id,
         channel_id=ch.id,
@@ -1408,9 +2091,18 @@ Retorne apenas o texto da legenda."""
         duration_seconds=data.seconds,
         size=data.size,
         published=False,
+        credits_consumed=total_credits,
     )
     db.add(v)
     db.commit()
+    
+    # Update resource_id in credit_usage records
+    db.execute(
+        text("UPDATE credit_usage SET resource_id = :video_id WHERE resource_id IS NULL AND user_id = :user_id AND channel_id = :channel_id"),
+        {"video_id": video_id, "user_id": current_user.id, "channel_id": ch.id}
+    )
+    db.commit()
+    
     db.refresh(v)
     return video_to_schema(v)
 
@@ -1519,6 +2211,7 @@ def publish_video(
             raise HTTPException(status_code=502, detail=f"Erro ao publicar Reel: {error_msg}")
 
         v.published = True
+        v.ig_media_id = pub_data["id"]
         db.commit()
         db.refresh(v)
         return video_to_schema(v)
@@ -1527,6 +2220,954 @@ def publish_video(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Video Projects (editor)
+# ---------------------------------------------------------------------------
+
+def _video_project_to_schema(vp: VideoProjectDB, db: Session) -> VideoProjectOut:
+    try:
+        clip_ids = json.loads(vp.clip_ids or "[]")
+    except Exception:
+        clip_ids = []
+    clips = []
+    for cid in clip_ids:
+        v = db.query(VideoDB).filter(VideoDB.id == cid).first()
+        if v:
+            clips.append(video_to_schema(v))
+    return VideoProjectOut(
+        id=vp.id,
+        channel_id=vp.channel_id,
+        title=vp.title or "",
+        clips=clips,
+        exported_path=vp.exported_path,
+        created_at=vp.created_at.isoformat() if vp.created_at else datetime.now().isoformat(),
+        updated_at=vp.updated_at.isoformat() if vp.updated_at else datetime.now().isoformat(),
+    )
+
+
+def _get_project_or_404(project_id: str, user: UserDB, db: Session) -> VideoProjectDB:
+    vp = db.query(VideoProjectDB).filter(
+        VideoProjectDB.id == project_id,
+        VideoProjectDB.user_id == user.id,
+    ).first()
+    if not vp:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+    return vp
+
+
+@app.post("/api/video-projects", response_model=VideoProjectOut)
+def create_video_project(
+    data: CreateVideoProjectRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ch = get_channel_or_404(data.channel_id, current_user, db)
+    v = db.query(VideoDB).filter(VideoDB.id == data.video_id, VideoDB.channel_id == ch.id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    project_id = f"proj_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    vp = VideoProjectDB(
+        id=project_id,
+        channel_id=ch.id,
+        user_id=current_user.id,
+        title=f"Projeto {ch.name}",
+        clip_ids=json.dumps([data.video_id]),
+        clip_urls=json.dumps({data.video_id: v.video_path}),
+        root_video_id=data.video_id,
+    )
+    db.add(vp)
+    db.commit()
+    db.refresh(vp)
+    return _video_project_to_schema(vp, db)
+
+
+@app.get("/api/video-projects/{project_id}", response_model=VideoProjectOut)
+def get_video_project(
+    project_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vp = _get_project_or_404(project_id, current_user, db)
+    return _video_project_to_schema(vp, db)
+
+
+@app.put("/api/video-projects/{project_id}/clips", response_model=VideoProjectOut)
+def update_video_project_clips(
+    project_id: str,
+    data: UpdateVideoProjectClipsRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vp = _get_project_or_404(project_id, current_user, db)
+    vp.clip_ids = json.dumps(data.clip_ids)
+    db.commit()
+    db.refresh(vp)
+    return _video_project_to_schema(vp, db)
+
+
+@app.post("/api/video-projects/{project_id}/add-video", response_model=VideoProjectOut)
+def add_video_to_project(
+    project_id: str,
+    data: AddVideoToProjectRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vp = _get_project_or_404(project_id, current_user, db)
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == current_user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == data.video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+
+    try:
+        clip_ids = json.loads(vp.clip_ids or "[]")
+    except Exception:
+        clip_ids = []
+
+    # Heal legacy projects that have root_video_id = NULL
+    if not vp.root_video_id and clip_ids:
+        vp.root_video_id = clip_ids[0]
+
+    if data.video_id not in clip_ids:
+        clip_ids.append(data.video_id)
+        vp.clip_ids = json.dumps(clip_ids)
+
+    try:
+        clip_urls = json.loads(vp.clip_urls or "{}")
+    except Exception:
+        clip_urls = {}
+    if data.video_id not in clip_urls:
+        clip_urls[data.video_id] = v.video_path
+        vp.clip_urls = json.dumps(clip_urls)
+
+    v.is_project_clip = True
+    db.commit()
+    db.refresh(vp)
+    return _video_project_to_schema(vp, db)
+
+
+@app.post("/api/video-projects/{project_id}/generate", response_model=VideoProjectOut)
+def generate_project_clip(
+    project_id: str,
+    data: GenerateProjectClipRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    import time
+    vp = _get_project_or_404(project_id, current_user, db)
+    ch = get_channel_or_404(vp.channel_id, current_user, db)
+    s = get_or_create_settings(current_user, db)
+
+    if not AZURE_SORA_ENDPOINT or not AZURE_SORA_API_KEY:
+        raise HTTPException(status_code=400, detail="Sora não configurado.")
+
+    base_prompt = ch.image_generation_prompt or f"Instagram Reel for channel '{ch.name}'. Theme: {ch.objective}."
+    prompt = base_prompt
+    if data.additional_prompt:
+        prompt += f" {data.additional_prompt}"
+    prompt = prompt[:4000]
+
+    try:
+        create_resp = requests.post(
+            AZURE_SORA_ENDPOINT,
+            headers=_sora_headers(),
+            json={"prompt": prompt, "model": "sora-2", "size": data.size, "seconds": str(data.seconds)},
+            timeout=30,
+        )
+        if not create_resp.ok:
+            raise HTTPException(status_code=502, detail=f"Falha ao criar job Sora: {create_resp.status_code} - {create_resp.text}")
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao criar job Sora: {str(e)}")
+
+    job = create_resp.json()
+    job_id = job.get("id") or job.get("job_id") or job.get("generation_id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail=f"Resposta inesperada do Sora: {job}")
+
+    caption = ""
+    try:
+        client = get_azure_client(s)
+        cap_resp = client.chat.completions.create(
+            model=s.azure_openai_deployment_name,
+            messages=[
+                {"role": "system", "content": "Você é um especialista em conteúdo para Instagram."},
+                {"role": "user", "content": f"Crie uma legenda curta para um clipe: {data.additional_prompt or prompt[:200]}. Retorne apenas a legenda."},
+            ],
+            max_tokens=200, temperature=0.7,
+        )
+        caption = cap_resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Caption generation failed: {e}")
+
+    poll_url = f"{AZURE_SORA_ENDPOINT}/{job_id}"
+    deadline = datetime.now().timestamp() + 240
+    completed = False
+    while datetime.now().timestamp() < deadline:
+        time.sleep(5)
+        try:
+            poll_resp = requests.get(poll_url, headers=_sora_headers(), timeout=15)
+            result = poll_resp.json()
+            status = result.get("status", "")
+        except Exception:
+            continue
+        if status == "completed":
+            completed = True
+            break
+        if status in ("failed", "error", "cancelled"):
+            err_obj = result.get("error") or {}
+            err = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+            raise HTTPException(status_code=502, detail=f"Sora falhou: {err or status}")
+
+    if not completed:
+        raise HTTPException(status_code=504, detail="Timeout aguardando o Sora.")
+
+    video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    content_url = f"{AZURE_SORA_ENDPOINT}/{job_id}/content"
+    try:
+        dl = requests.get(content_url, headers=_sora_headers(), timeout=120, allow_redirects=True)
+        dl.raise_for_status()
+        blob_url = upload_bytes_to_blob(dl.content, f"videos/{video_id}.mp4", "video/mp4")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar vídeo: {str(e)}")
+
+    v = VideoDB(
+        id=video_id,
+        channel_id=ch.id,
+        channel_name=ch.name,
+        prompt=prompt,
+        caption=caption,
+        video_path=blob_url,
+        duration_seconds=data.seconds,
+        size=data.size,
+        published=False,
+        is_project_clip=True,
+    )
+    db.add(v)
+
+    try:
+        clip_ids = json.loads(vp.clip_ids or "[]")
+    except Exception:
+        clip_ids = []
+    clip_ids.append(video_id)
+    vp.clip_ids = json.dumps(clip_ids)
+
+    try:
+        clip_urls = json.loads(vp.clip_urls or "{}")
+    except Exception:
+        clip_urls = {}
+    clip_urls[video_id] = blob_url
+    vp.clip_urls = json.dumps(clip_urls)
+
+    db.commit()
+    db.refresh(vp)
+    return _video_project_to_schema(vp, db)
+
+
+@app.post("/api/video-projects/{project_id}/save", response_model=VideoProjectOut)
+def save_video_project(
+    project_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vp = _get_project_or_404(project_id, current_user, db)
+
+    try:
+        clip_ids = json.loads(vp.clip_ids or "[]")
+    except Exception:
+        clip_ids = []
+
+    if not clip_ids:
+        raise HTTPException(status_code=400, detail="Projeto sem clipes")
+
+    clips = []
+    for cid in clip_ids:
+        v = db.query(VideoDB).filter(VideoDB.id == cid).first()
+        if v and v.video_path:
+            clips.append(v)
+
+    if not clips:
+        raise HTTPException(status_code=400, detail="Nenhum clipe válido encontrado")
+
+    try:
+        clip_url_map = json.loads(vp.clip_urls or "{}")
+    except Exception:
+        clip_url_map = {}
+
+    if len(clips) == 1:
+        merged_url = clip_url_map.get(clips[0].id) or clips[0].video_path
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip_files = []
+            for i, v in enumerate(clips):
+                clip_path = os.path.join(tmpdir, f"clip_{i}.mp4")
+                source_url = clip_url_map.get(v.id) or v.video_path
+                try:
+                    dl = requests.get(source_url, timeout=120, stream=True)
+                    dl.raise_for_status()
+                    with open(clip_path, "wb") as f:
+                        for chunk in dl.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                    clip_files.append(clip_path)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"Erro ao baixar clipe: {str(e)}")
+
+            concat_list = os.path.join(tmpdir, "concat.txt")
+            with open(concat_list, "w") as f:
+                for cp in clip_files:
+                    f.write(f"file '{cp}'\n")
+
+            output_path = os.path.join(tmpdir, "merged.mp4")
+            result = subprocess.run(
+                ["ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", output_path, "-y"],
+                capture_output=True, timeout=180,
+            )
+            if result.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Falha ao mesclar vídeos: {result.stderr.decode(errors='replace')}")
+
+            export_id = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            with open(output_path, "rb") as f:
+                merged_url = upload_bytes_to_blob(f.read(), f"videos/{export_id}.mp4", "video/mp4")
+
+    # Heal legacy projects that have root_video_id = NULL
+    if not vp.root_video_id and clip_ids:
+        vp.root_video_id = clip_ids[0]
+
+    if vp.exported_video_id:
+        # Re-export: overwrite only the previously compiled entry, never the original clips
+        exp_v = db.query(VideoDB).filter(VideoDB.id == vp.exported_video_id).first()
+        if exp_v:
+            exp_v.video_path = merged_url
+            exp_v.duration_seconds = sum(c.duration_seconds or 0 for c in clips)
+    else:
+        # First export: create a new VideoDB entry for the compiled result
+        root_v = db.query(VideoDB).filter(VideoDB.id == vp.root_video_id).first() if vp.root_video_id else None
+        export_video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        exp_v = VideoDB(
+            id=export_video_id,
+            channel_id=vp.channel_id,
+            channel_name=root_v.channel_name if root_v else "",
+            prompt=root_v.prompt if root_v else "",
+            caption=root_v.caption if root_v else "",
+            video_path=merged_url,
+            duration_seconds=sum(c.duration_seconds or 0 for c in clips),
+            size=clips[0].size if clips else "720x1280",
+            published=False,
+            is_project_clip=False,
+        )
+        db.add(exp_v)
+        vp.exported_video_id = export_video_id
+
+        # Hide the original root clip from the feed — the compiled entry replaces it
+        if root_v:
+            root_v.is_project_clip = True
+
+    vp.exported_path = merged_url
+    db.commit()
+    db.refresh(vp)
+    return _video_project_to_schema(vp, db)
+
+
+@app.post("/api/video-projects/{project_id}/export")
+def export_video_project(
+    project_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    vp = _get_project_or_404(project_id, current_user, db)
+
+    try:
+        clip_ids = json.loads(vp.clip_ids or "[]")
+    except Exception:
+        clip_ids = []
+
+    if not clip_ids:
+        raise HTTPException(status_code=400, detail="Projeto sem clipes")
+
+    clips = []
+    for cid in clip_ids:
+        v = db.query(VideoDB).filter(VideoDB.id == cid).first()
+        if v and v.video_path:
+            clips.append(v)
+
+    if not clips:
+        raise HTTPException(status_code=400, detail="Nenhum clipe válido encontrado")
+
+    if len(clips) == 1:
+        vp.exported_path = clips[0].video_path
+        db.commit()
+        return {"exported_url": clips[0].video_path}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clip_files = []
+        for i, v in enumerate(clips):
+            clip_path = os.path.join(tmpdir, f"clip_{i}.mp4")
+            try:
+                dl = requests.get(v.video_path, timeout=120, stream=True)
+                dl.raise_for_status()
+                with open(clip_path, "wb") as f:
+                    for chunk in dl.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                clip_files.append(clip_path)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Erro ao baixar clipe {v.id}: {str(e)}")
+
+        concat_list = os.path.join(tmpdir, "concat.txt")
+        with open(concat_list, "w") as f:
+            for cp in clip_files:
+                f.write(f"file '{cp}'\n")
+
+        output_path = os.path.join(tmpdir, "merged.mp4")
+        result = subprocess.run(
+            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", output_path, "-y"],
+            capture_output=True, timeout=180,
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Falha ao mesclar vídeos: {result.stderr.decode(errors='replace')}")
+
+        export_id = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        with open(output_path, "rb") as f:
+            blob_url = upload_bytes_to_blob(f.read(), f"videos/{export_id}.mp4", "video/mp4")
+
+    vp.exported_path = blob_url
+    db.commit()
+    return {"exported_url": blob_url}
+
+
+# ---------------------------------------------------------------------------
+# Reference Images endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/channels/{channel_id}/references", response_model=List[ReferenceImageOut])
+def list_reference_images(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    get_channel_or_404(channel_id, current_user, db)
+    refs = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.channel_id == channel_id,
+    ).order_by(ReferenceImageDB.created_at.desc()).all()
+    return [ReferenceImageOut(
+        id=r.id,
+        channel_id=r.channel_id,
+        blob_url=r.blob_url,
+        description=r.description,
+        created_at=r.created_at.isoformat(),
+    ) for r in refs]
+
+
+@app.post("/api/channels/{channel_id}/references/upload", response_model=ReferenceImageOut, status_code=201)
+def upload_reference_image(
+    channel_id: str,
+    file: UploadFile = File(...),
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    get_channel_or_404(channel_id, current_user, db)
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
+
+    data = file.file.read()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    ext = (file.content_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
+    blob_url = upload_bytes_to_blob(data, f"references/{channel_id}_{ts}.{ext}", file.content_type or "image/jpeg")
+
+    # Auto-describe via vision model
+    description = None
+    s = db.query(SettingsDB).filter(SettingsDB.user_id == current_user.id).first()
+    if s and s.azure_openai_endpoint and s.azure_openai_api_key:
+        try:
+            client = get_azure_client(s)
+            vision_resp = client.chat.completions.create(
+                model=s.azure_openai_deployment_name,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Describe the physical appearance of the person in this photo in detail "
+                                "(face shape, hair color and style, eye color, skin tone, distinctive features, age range). "
+                                "Be specific and concise — this description will be used in AI image generation prompts. "
+                                "Answer in English. If there is no person visible, reply with 'no person detected'."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": blob_url}},
+                    ],
+                }],
+                max_tokens=200,
+            )
+            desc = vision_resp.choices[0].message.content.strip()
+            if "no person detected" not in desc.lower():
+                description = desc
+        except Exception as e:
+            print(f"Vision description failed: {e}")
+
+    ref = ReferenceImageDB(
+        channel_id=channel_id,
+        user_id=current_user.id,
+        blob_url=blob_url,
+        description=description,
+    )
+    db.add(ref)
+    db.commit()
+    db.refresh(ref)
+    return ReferenceImageOut(
+        id=ref.id,
+        channel_id=ref.channel_id,
+        blob_url=ref.blob_url,
+        description=ref.description,
+        created_at=ref.created_at.isoformat(),
+    )
+
+
+@app.delete("/api/channels/{channel_id}/references/{ref_id}", status_code=204)
+def delete_reference_image(
+    channel_id: str,
+    ref_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    get_channel_or_404(channel_id, current_user, db)
+    ref = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.id == ref_id,
+        ReferenceImageDB.channel_id == channel_id,
+    ).first()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Imagem de referência não encontrada")
+    db.delete(ref)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Insights endpoints
+# ---------------------------------------------------------------------------
+
+def _get_video_or_404(video_id: str, user: UserDB, db: Session) -> VideoDB:
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    return v
+
+
+@app.get("/api/posts/{post_id}/insights", response_model=InsightsOut)
+def get_post_insights(
+    post_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    p = _get_post_or_404(post_id, current_user, db)
+    if not p.published or not getattr(p, "ig_media_id", None):
+        raise HTTPException(status_code=404, detail="Post não publicado ou sem ID do Instagram")
+    ch = db.query(ChannelDB).filter(ChannelDB.id == p.channel_id).first()
+    if not ch or not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não conectado")
+    ins = db.query(MediaInsightsDB).filter(
+        MediaInsightsDB.media_type == "post", MediaInsightsDB.media_id == post_id,
+    ).first()
+    if _insights_stale(ins, p.created_at):
+        ins = _fetch_and_store_insights("post", post_id, p.ig_media_id, p.channel_id, ch.instagram_access_token, db)
+    return _insights_to_schema(ins)
+
+
+@app.post("/api/posts/{post_id}/insights/refresh", response_model=InsightsOut)
+def refresh_post_insights(
+    post_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    p = _get_post_or_404(post_id, current_user, db)
+    if not p.published or not getattr(p, "ig_media_id", None):
+        raise HTTPException(status_code=404, detail="Post não publicado ou sem ID do Instagram")
+    ch = db.query(ChannelDB).filter(ChannelDB.id == p.channel_id).first()
+    if not ch or not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não conectado")
+    ins = _fetch_and_store_insights("post", post_id, p.ig_media_id, p.channel_id, ch.instagram_access_token, db)
+    return _insights_to_schema(ins)
+
+
+@app.get("/api/videos/{video_id}/insights", response_model=InsightsOut)
+def get_video_insights(
+    video_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    v = _get_video_or_404(video_id, current_user, db)
+    if not v.published or not getattr(v, "ig_media_id", None):
+        raise HTTPException(status_code=404, detail="Vídeo não publicado ou sem ID do Instagram")
+    ch = db.query(ChannelDB).filter(ChannelDB.id == v.channel_id).first()
+    if not ch or not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não conectado")
+    ins = db.query(MediaInsightsDB).filter(
+        MediaInsightsDB.media_type == "video", MediaInsightsDB.media_id == video_id,
+    ).first()
+    if _insights_stale(ins, v.created_at):
+        ins = _fetch_and_store_insights("video", video_id, v.ig_media_id, v.channel_id, ch.instagram_access_token, db)
+    return _insights_to_schema(ins)
+
+
+@app.post("/api/videos/{video_id}/insights/refresh", response_model=InsightsOut)
+def refresh_video_insights(
+    video_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    v = _get_video_or_404(video_id, current_user, db)
+    if not v.published or not getattr(v, "ig_media_id", None):
+        raise HTTPException(status_code=404, detail="Vídeo não publicado ou sem ID do Instagram")
+    ch = db.query(ChannelDB).filter(ChannelDB.id == v.channel_id).first()
+    if not ch or not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não conectado")
+    ins = _fetch_and_store_insights("video", video_id, v.ig_media_id, v.channel_id, ch.instagram_access_token, db)
+    return _insights_to_schema(ins)
+
+
+@app.get("/api/channels/{channel_id}/dashboard", response_model=ChannelDashboardOut)
+def get_channel_dashboard(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ch = get_channel_or_404(channel_id, current_user, db)
+
+    posts = db.query(PostDB).filter(
+        PostDB.channel_id == channel_id,
+        PostDB.published == True,
+        PostDB.ig_media_id.isnot(None),
+    ).all()
+
+    videos = db.query(VideoDB).filter(
+        VideoDB.channel_id == channel_id,
+        VideoDB.published == True,
+        VideoDB.ig_media_id.isnot(None),
+        VideoDB.is_project_clip.is_not(True),
+    ).all()
+
+    post_ids = [p.id for p in posts]
+    video_ids = [v.id for v in videos]
+    insights_map = {}
+
+    if post_ids:
+        for ins in db.query(MediaInsightsDB).filter(
+            MediaInsightsDB.media_type == "post",
+            MediaInsightsDB.media_id.in_(post_ids),
+        ).all():
+            insights_map[("post", ins.media_id)] = ins
+
+    if video_ids:
+        for ins in db.query(MediaInsightsDB).filter(
+            MediaInsightsDB.media_type == "video",
+            MediaInsightsDB.media_id.in_(video_ids),
+        ).all():
+            insights_map[("video", ins.media_id)] = ins
+
+    items = []
+    for p in posts:
+        ins = insights_map.get(("post", p.id))
+        if ins:
+            items.append(DashboardItemOut(
+                media_type="post", media_id=p.id,
+                preview_url=p.image_path or "",
+                text_preview=(p.text or "")[:120],
+                created_at=p.created_at.isoformat(),
+                published=True,
+                insights=_insights_to_schema(ins),
+            ))
+    for v in videos:
+        ins = insights_map.get(("video", v.id))
+        if ins:
+            items.append(DashboardItemOut(
+                media_type="video", media_id=v.id,
+                preview_url=v.video_path or "",
+                text_preview=(v.caption or v.prompt or "")[:120],
+                created_at=v.created_at.isoformat(),
+                published=True,
+                insights=_insights_to_schema(ins),
+            ))
+
+    total_reach = sum(i.insights.reach or 0 for i in items)
+    total_impressions = sum(i.insights.impressions or 0 for i in items)
+    total_interactions = sum(i.insights.total_interactions for i in items)
+    total_likes = sum(i.insights.like_count for i in items)
+    total_comments = sum(i.insights.comments_count for i in items)
+    rates = [i.insights.engagement_rate for i in items if i.insights.engagement_rate is not None]
+    avg_rate = round(sum(rates) / len(rates), 2) if rates else None
+
+    top_by_reach = sorted(items, key=lambda x: x.insights.reach or 0, reverse=True)[:5]
+    top_by_engagement = sorted(items, key=lambda x: x.insights.engagement_rate or 0.0, reverse=True)[:5]
+    top_by_likes = sorted(items, key=lambda x: x.insights.like_count, reverse=True)[:5]
+    top_by_comments = sorted(items, key=lambda x: x.insights.comments_count, reverse=True)[:5]
+
+    all_ins = list(insights_map.values())
+    last_refreshed = None
+    if all_ins:
+        valid = [ins.fetched_at for ins in all_ins if ins.fetched_at]
+        if valid:
+            last_refreshed = max(valid).isoformat()
+
+    return ChannelDashboardOut(
+        channel_id=ch.id,
+        channel_name=ch.name,
+        published_count=len(posts) + len(videos),
+        total_reach=total_reach,
+        total_impressions=total_impressions,
+        total_interactions=total_interactions,
+        total_likes=total_likes,
+        total_comments=total_comments,
+        avg_engagement_rate=avg_rate,
+        top_by_reach=top_by_reach,
+        top_by_engagement=top_by_engagement,
+        top_by_likes=top_by_likes,
+        top_by_comments=top_by_comments,
+        last_refreshed=last_refreshed,
+    )
+
+
+@app.post("/api/channels/{channel_id}/insights/refresh")
+def refresh_channel_insights(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ch = get_channel_or_404(channel_id, current_user, db)
+    if not ch.instagram_access_token:
+        raise HTTPException(status_code=400, detail="Instagram não conectado a este canal")
+
+    posts = db.query(PostDB).filter(
+        PostDB.channel_id == channel_id,
+        PostDB.published == True,
+        PostDB.ig_media_id.isnot(None),
+    ).all()
+    videos = db.query(VideoDB).filter(
+        VideoDB.channel_id == channel_id,
+        VideoDB.published == True,
+        VideoDB.ig_media_id.isnot(None),
+        VideoDB.is_project_clip.is_not(True),
+    ).all()
+
+    refreshed, errors = 0, 0
+    for p in posts:
+        try:
+            _fetch_and_store_insights("post", p.id, p.ig_media_id, channel_id, ch.instagram_access_token, db)
+            refreshed += 1
+        except Exception as e:
+            print(f"Refresh error post {p.id}: {e}")
+            errors += 1
+    for v in videos:
+        try:
+            _fetch_and_store_insights("video", v.id, v.ig_media_id, channel_id, ch.instagram_access_token, db)
+            refreshed += 1
+        except Exception as e:
+            print(f"Refresh error video {v.id}: {e}")
+            errors += 1
+
+    return {"refreshed": refreshed, "errors": errors, "total": len(posts) + len(videos)}
+
+
+# ---------------------------------------------------------------------------
+# Credits endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/credits/summary")
+def get_credits_summary(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna um resumo do consumo de créditos do usuário.
+    """
+    # Total geral
+    total_result = db.execute(
+        text("SELECT SUM(credits_consumed) as total FROM credit_usage WHERE user_id = :user_id"),
+        {"user_id": current_user.id}
+    ).fetchone()
+    total_credits = float(total_result[0] or 0.0)
+    
+    # Por tipo de operação
+    by_operation = db.execute(
+        text("""
+            SELECT operation_type, SUM(credits_consumed) as total
+            FROM credit_usage
+            WHERE user_id = :user_id
+            GROUP BY operation_type
+            ORDER BY total DESC
+        """),
+        {"user_id": current_user.id}
+    ).fetchall()
+    
+    # Por canal
+    by_channel = db.execute(
+        text("""
+            SELECT c.name as channel_name, cu.channel_id, SUM(cu.credits_consumed) as total
+            FROM credit_usage cu
+            LEFT JOIN channels c ON cu.channel_id = c.id
+            WHERE cu.user_id = :user_id AND cu.channel_id IS NOT NULL
+            GROUP BY cu.channel_id, c.name
+            ORDER BY total DESC
+        """),
+        {"user_id": current_user.id}
+    ).fetchall()
+    
+    # Por tipo de recurso
+    by_resource = db.execute(
+        text("""
+            SELECT resource_type, SUM(credits_consumed) as total
+            FROM credit_usage
+            WHERE user_id = :user_id
+            GROUP BY resource_type
+            ORDER BY total DESC
+        """),
+        {"user_id": current_user.id}
+    ).fetchall()
+    
+    # Últimos 30 dias
+    last_30_days = db.execute(
+        text("""
+            SELECT DATE(created_at) as date, SUM(credits_consumed) as total
+            FROM credit_usage
+            WHERE user_id = :user_id AND created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+        """),
+        {"user_id": current_user.id}
+    ).fetchall()
+    
+    return {
+        "total_credits": total_credits,
+        "by_operation": [{"operation_type": row[0], "credits": float(row[1] or 0.0)} for row in by_operation],
+        "by_channel": [{"channel_id": row[1], "channel_name": row[0], "credits": float(row[2] or 0.0)} for row in by_channel],
+        "by_resource": [{"resource_type": row[0], "credits": float(row[1] or 0.0)} for row in by_resource],
+        "last_30_days": [{"date": str(row[0]), "credits": float(row[1] or 0.0)} for row in last_30_days],
+    }
+
+
+@app.get("/api/credits/log", response_model=List[CreditUsageOut])
+def get_credits_log(
+    channel_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna o log detalhado de consumo de créditos.
+    """
+    query = db.query(CreditUsageDB).filter(CreditUsageDB.user_id == current_user.id)
+    
+    if channel_id:
+        query = query.filter(CreditUsageDB.channel_id == channel_id)
+    
+    if resource_type:
+        query = query.filter(CreditUsageDB.resource_type == resource_type)
+    
+    usage_records = query.order_by(CreditUsageDB.created_at.desc()).limit(limit).all()
+    
+    # Get channel names
+    channel_ids = list(set([r.channel_id for r in usage_records if r.channel_id]))
+    channel_names = {}
+    if channel_ids:
+        channels = db.query(ChannelDB.id, ChannelDB.name).filter(ChannelDB.id.in_(channel_ids)).all()
+        channel_names = {ch.id: ch.name for ch in channels}
+    
+    result = []
+    for record in usage_records:
+        result.append(CreditUsageOut(
+            id=record.id,
+            user_id=record.user_id,
+            channel_id=record.channel_id,
+            channel_name=channel_names.get(record.channel_id),
+            resource_type=record.resource_type,
+            resource_id=record.resource_id,
+            operation_type=record.operation_type,
+            model_name=record.model_name,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            total_tokens=record.total_tokens,
+            credits_consumed=record.credits_consumed,
+            metadata=json.loads(record.metadata or "{}"),
+            created_at=record.created_at.isoformat(),
+        ))
+    
+    return result
+
+
+@app.get("/api/credits/channel/{channel_id}")
+def get_channel_credits(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna estatísticas de créditos para um canal específico.
+    """
+    ch = get_channel_or_404(channel_id, current_user, db)
+    
+    # Total do canal
+    total_result = db.execute(
+        text("SELECT SUM(credits_consumed) as total FROM credit_usage WHERE channel_id = :channel_id"),
+        {"channel_id": channel_id}
+    ).fetchone()
+    total_credits = float(total_result[0] or 0.0)
+    
+    # Por tipo de operação
+    by_operation = db.execute(
+        text("""
+            SELECT operation_type, SUM(credits_consumed) as total, COUNT(*) as count
+            FROM credit_usage
+            WHERE channel_id = :channel_id
+            GROUP BY operation_type
+            ORDER BY total DESC
+        """),
+        {"channel_id": channel_id}
+    ).fetchall()
+    
+    # Últimos recursos criados com créditos
+    recent_resources = db.execute(
+        text("""
+            SELECT resource_type, resource_id, SUM(credits_consumed) as total, MAX(created_at) as created_at
+            FROM credit_usage
+            WHERE channel_id = :channel_id AND resource_id IS NOT NULL
+            GROUP BY resource_type, resource_id
+            ORDER BY created_at DESC
+            LIMIT 20
+        """),
+        {"channel_id": channel_id}
+    ).fetchall()
+    
+    return {
+        "channel_id": channel_id,
+        "channel_name": ch.name,
+        "total_credits": total_credits,
+        "by_operation": [
+            {
+                "operation_type": row[0],
+                "credits": float(row[1] or 0.0),
+                "count": int(row[2])
+            } for row in by_operation
+        ],
+        "recent_resources": [
+            {
+                "resource_type": row[0],
+                "resource_id": row[1],
+                "credits": float(row[2] or 0.0),
+                "created_at": row[3].isoformat() if row[3] else None
+            } for row in recent_resources
+        ],
+    }
 
 
 if __name__ == "__main__":
