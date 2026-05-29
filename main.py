@@ -24,6 +24,7 @@ from sqlalchemy.sql import func
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from azure.storage.blob import BlobServiceClient, ContentSettings
+import mercadopago
 
 load_dotenv()
 
@@ -57,6 +58,8 @@ INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
 INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -71,9 +74,11 @@ class UserDB(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     name = Column(String(255), nullable=False)
+    credits_balance = Column(Float, default=0.0)  # Saldo de créditos disponíveis
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     channels = relationship("ChannelDB", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("SettingsDB", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    payments = relationship("PaymentDB", back_populates="user", cascade="all, delete-orphan")
 
 
 class ChannelDB(Base):
@@ -217,6 +222,21 @@ class CreditUsageDB(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class PaymentDB(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    mp_payment_id = Column(String(100), unique=True, nullable=False)  # ID do Mercado Pago
+    amount = Column(Float, nullable=False)  # Valor em R$
+    credits_amount = Column(Float, nullable=False)  # Quantidade de créditos (1 R$ = 1 crédito)
+    status = Column(String(20), default="pending")  # pending | approved | rejected | cancelled
+    qr_code = Column(Text, nullable=True)  # QRCode base64
+    qr_code_data = Column(Text, nullable=True)  # Código PIX copia-cola
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    user = relationship("UserDB", back_populates="payments")
+
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
@@ -270,6 +290,7 @@ def on_startup():
             conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS ig_media_id VARCHAR(100)"))
             conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS credits_consumed FLOAT DEFAULT 0.0"))
             conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS credits_consumed FLOAT DEFAULT 0.0"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits_balance FLOAT DEFAULT 0.0"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS reference_images (
                     id SERIAL PRIMARY KEY,
@@ -297,6 +318,20 @@ def on_startup():
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    mp_payment_id VARCHAR(100) UNIQUE NOT NULL,
+                    amount FLOAT NOT NULL,
+                    credits_amount FLOAT NOT NULL,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    qr_code TEXT,
+                    qr_code_data TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
             conn.commit()
     except Exception:
         pass
@@ -320,6 +355,7 @@ class UserOut(BaseModel):
     id: int
     email: str
     name: str
+    credits_balance: float
     created_at: datetime
 
     class Config:
@@ -556,6 +592,26 @@ class CreditUsageOut(BaseModel):
     credits_consumed: float
     metadata: dict
     created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class PaymentCreate(BaseModel):
+    amount: float  # Valor em R$ (1 R$ = 1 crédito)
+
+
+class PaymentOut(BaseModel):
+    id: int
+    user_id: int
+    mp_payment_id: str
+    amount: float
+    credits_amount: float
+    status: str
+    qr_code: Optional[str] = None
+    qr_code_data: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -1114,6 +1170,164 @@ def list_all_users(
     
     users = db.query(UserDB).order_by(UserDB.created_at.desc()).all()
     return [UserOut.model_validate(u) for u in users]
+
+
+# ---------------------------------------------------------------------------
+# Payment endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/payments/create")
+def create_payment(
+    payment_data: PaymentCreate,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cria uma cobrança PIX no Mercado Pago"""
+    if not MERCADOPAGO_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
+    
+    try:
+        # Inicializar SDK do Mercado Pago
+        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
+        
+        # Criar dados do pagamento PIX
+        payment_request = {
+            "transaction_amount": float(payment_data.amount),
+            "description": f"Compra de {payment_data.amount} créditos PostGen",
+            "payment_method_id": "pix",
+            "payer": {
+                "email": current_user.email,
+                "first_name": current_user.name.split()[0] if current_user.name else "Cliente",
+            },
+            "notification_url": f"{BASE_URL}/api/payments/webhook",
+        }
+        
+        # Criar pagamento
+        payment_response = sdk.payment().create(payment_request)
+        payment = payment_response["response"]
+        
+        if payment_response["status"] not in [200, 201]:
+            raise HTTPException(status_code=500, detail="Erro ao criar pagamento")
+        
+        # Extrair informações do PIX
+        mp_payment_id = str(payment["id"])
+        qr_code_base64 = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code_base64", "")
+        qr_code_data = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code", "")
+        
+        # Salvar no banco
+        db_payment = PaymentDB(
+            user_id=current_user.id,
+            mp_payment_id=mp_payment_id,
+            amount=payment_data.amount,
+            credits_amount=payment_data.amount,  # 1 R$ = 1 crédito
+            status="pending",
+            qr_code=qr_code_base64,
+            qr_code_data=qr_code_data,
+        )
+        db.add(db_payment)
+        db.commit()
+        db.refresh(db_payment)
+        
+        return {
+            "payment_id": db_payment.id,
+            "mp_payment_id": mp_payment_id,
+            "amount": payment_data.amount,
+            "credits_amount": payment_data.amount,
+            "status": "pending",
+            "qr_code": qr_code_base64,
+            "qr_code_data": qr_code_data,
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao criar pagamento: {str(e)}")
+
+
+@app.post("/api/payments/webhook")
+async def payment_webhook(
+    request: dict,
+    db: Session = Depends(get_db),
+):
+    """Webhook para receber notificações do Mercado Pago"""
+    try:
+        # Verificar se é notificação de pagamento
+        if request.get("type") != "payment":
+            return {"status": "ignored"}
+        
+        # Obter ID do pagamento
+        mp_payment_id = str(request.get("data", {}).get("id", ""))
+        if not mp_payment_id:
+            return {"status": "error", "message": "Payment ID not found"}
+        
+        # Buscar pagamento no banco
+        payment = db.query(PaymentDB).filter(PaymentDB.mp_payment_id == mp_payment_id).first()
+        if not payment:
+            return {"status": "error", "message": "Payment not found in database"}
+        
+        # Consultar status atualizado no Mercado Pago
+        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
+        payment_info = sdk.payment().get(mp_payment_id)
+        
+        if payment_info["status"] != 200:
+            return {"status": "error", "message": "Failed to get payment info"}
+        
+        mp_status = payment_info["response"].get("status", "")
+        
+        # Atualizar status no banco
+        payment.status = mp_status
+        payment.updated_at = func.now()
+        
+        # Se aprovado, adicionar créditos ao usuário
+        if mp_status == "approved" and payment.status != "approved":
+            user = db.query(UserDB).filter(UserDB.id == payment.user_id).first()
+            if user:
+                user.credits_balance += payment.credits_amount
+        
+        db.commit()
+        
+        return {"status": "success", "payment_status": mp_status}
+    
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/payments/{payment_id}")
+def get_payment_status(
+    payment_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Consulta o status de um pagamento"""
+    payment = db.query(PaymentDB).filter(
+        PaymentDB.id == payment_id,
+        PaymentDB.user_id == current_user.id
+    ).first()
+    
+    if not payment:
+        raise HTTPException(status_code=404, detail="Pagamento não encontrado")
+    
+    # Consultar status atualizado no Mercado Pago
+    try:
+        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
+        payment_info = sdk.payment().get(payment.mp_payment_id)
+        
+        if payment_info["status"] == 200:
+            mp_status = payment_info["response"].get("status", payment.status)
+            
+            # Atualizar status se mudou
+            if mp_status != payment.status:
+                old_status = payment.status
+                payment.status = mp_status
+                payment.updated_at = func.now()
+                
+                # Se aprovado agora, adicionar créditos
+                if mp_status == "approved" and old_status != "approved":
+                    current_user.credits_balance += payment.credits_amount
+                
+                db.commit()
+                db.refresh(payment)
+    except Exception:
+        pass  # Se falhar, retorna o status atual do banco
+    
+    return PaymentOut.model_validate(payment)
 
 
 # ---------------------------------------------------------------------------
