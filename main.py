@@ -222,6 +222,14 @@ class CreditUsageDB(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class SystemConfigDB(Base):
+    __tablename__ = "system_config"
+    id = Column(Integer, primary_key=True)
+    key = Column(String(100), unique=True, nullable=False, index=True)
+    value = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class PaymentDB(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -274,9 +282,31 @@ def upload_file_to_blob(file_path: str, blob_name: str, content_type: str = "ima
     return upload_bytes_to_blob(data, blob_name, content_type)
 
 
+def _get_system_config(db: Session, key: str, default: str = "") -> str:
+    row = db.query(SystemConfigDB).filter(SystemConfigDB.key == key).first()
+    return row.value if row else default
+
+
+def _set_system_config(db: Session, key: str, value: str):
+    row = db.query(SystemConfigDB).filter(SystemConfigDB.key == key).first()
+    if row:
+        row.value = value
+    else:
+        db.add(SystemConfigDB(key=key, value=value))
+    db.commit()
+
+
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    # Inicializa configurações padrão se não existirem
+    db = SessionLocal()
+    try:
+        if not db.query(SystemConfigDB).filter(SystemConfigDB.key == "markup_percentage").first():
+            db.add(SystemConfigDB(key="markup_percentage", value="0.0"))
+            db.commit()
+    finally:
+        db.close()
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT ''"))
@@ -1158,18 +1188,56 @@ def update_profile(
     return UserOut.model_validate(current_user)
 
 
+ADMIN_EMAIL = "daniel.fabbri@avanade.com"
+
+
+def _require_admin(current_user: UserDB):
+    if current_user.email != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Acesso negado")
+
+
 @app.get("/api/admin/users", response_model=list[UserOut])
 def list_all_users(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Lista todos os usuários (apenas para admin)"""
-    # Verificar se é admin
-    if current_user.email != "daniel.fabbri@avanade.com":
-        raise HTTPException(status_code=403, detail="Acesso negado")
-    
+    _require_admin(current_user)
     users = db.query(UserDB).order_by(UserDB.created_at.desc()).all()
     return [UserOut.model_validate(u) for u in users]
+
+
+@app.get("/api/admin/rates")
+def get_rates(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(current_user)
+    markup = float(_get_system_config(db, "markup_percentage", "0.0"))
+    credits_per_real = round(1 / (1 + markup / 100), 6) if markup > -100 else 0
+    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
+
+
+@app.put("/api/admin/rates")
+def update_rates(
+    payload: dict,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(current_user)
+    markup = float(payload.get("markup_percentage", 0))
+    if markup < 0:
+        raise HTTPException(status_code=422, detail="Markup não pode ser negativo")
+    _set_system_config(db, "markup_percentage", str(markup))
+    credits_per_real = round(1 / (1 + markup / 100), 6)
+    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
+
+
+@app.get("/api/payments/rates")
+def get_public_rates(db: Session = Depends(get_db)):
+    """Retorna a taxa de conversão atual (público)"""
+    markup = float(_get_system_config(db, "markup_percentage", "0.0"))
+    credits_per_real = round(1 / (1 + markup / 100), 6) if markup > -100 else 0
+    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
 
 
 # ---------------------------------------------------------------------------
@@ -1186,13 +1254,14 @@ def create_payment(
         raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
     
     try:
-        # Inicializar SDK do Mercado Pago
         sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
-        
-        # Criar dados do pagamento PIX
+
+        markup = float(_get_system_config(db, "markup_percentage", "0.0"))
+        credits_amount = round(payment_data.amount / (1 + markup / 100), 2)
+
         payment_request = {
             "transaction_amount": float(payment_data.amount),
-            "description": f"Compra de {payment_data.amount} créditos PostGen",
+            "description": f"Compra de {credits_amount} créditos PostGen",
             "payment_method_id": "pix",
             "payer": {
                 "email": current_user.email,
@@ -1200,25 +1269,23 @@ def create_payment(
             },
             "notification_url": f"{BASE_URL}/api/payments/webhook",
         }
-        
-        # Criar pagamento
+
         payment_response = sdk.payment().create(payment_request)
         payment = payment_response["response"]
-        
+
         if payment_response["status"] not in [200, 201]:
-            raise HTTPException(status_code=500, detail="Erro ao criar pagamento")
-        
-        # Extrair informações do PIX
+            mp_error = payment.get("message") or payment.get("error") or str(payment)
+            raise ValueError(f"Mercado Pago error {payment_response['status']}: {mp_error}")
+
         mp_payment_id = str(payment["id"])
         qr_code_base64 = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code_base64", "")
         qr_code_data = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code", "")
-        
-        # Salvar no banco
+
         db_payment = PaymentDB(
             user_id=current_user.id,
             mp_payment_id=mp_payment_id,
             amount=payment_data.amount,
-            credits_amount=payment_data.amount,  # 1 R$ = 1 crédito
+            credits_amount=credits_amount,
             status="pending",
             qr_code=qr_code_base64,
             qr_code_data=qr_code_data,
@@ -1226,7 +1293,7 @@ def create_payment(
         db.add(db_payment)
         db.commit()
         db.refresh(db_payment)
-        
+
         return {
             "payment_id": db_payment.id,
             "mp_payment_id": mp_payment_id,
@@ -1236,8 +1303,9 @@ def create_payment(
             "qr_code": qr_code_base64,
             "qr_code_data": qr_code_data,
         }
-    
+
     except Exception as e:
+        print(f"[MP] create_payment exception: {e}", flush=True)
         raise HTTPException(status_code=500, detail=f"Erro ao criar pagamento: {str(e)}")
 
 
