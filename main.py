@@ -449,6 +449,7 @@ class Post(BaseModel):
     id: str = ""
     text: str
     image_url: str
+    image_error: Optional[str] = None
 
 
 class InsightsOut(BaseModel):
@@ -1620,8 +1621,8 @@ def update_channel(
     ch = get_channel_or_404(channel_id, current_user, db)
     ch.name = data.name
     ch.objective = data.objective
-    ch.text_generation_prompt = data.text_generation_prompt
-    ch.image_generation_prompt = data.image_generation_prompt
+    ch.text_generation_prompt = data.text_generation_prompt or None
+    ch.image_generation_prompt = data.image_generation_prompt or None
     ch.avatar_url = data.avatar_url
     ch.suggested_image_url = data.suggested_image_url
     ch.instagram_user_id = data.instagram_user_id
@@ -2097,8 +2098,12 @@ Return only the post text."""
     image_prompt = None
     post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     blob_url = ""
+    image_error = None
     model_ready = s.azure_openai_image_endpoint or (ch.image_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
-    if model_ready:
+    if not model_ready:
+        image_error = "Endpoint de geração de imagem não configurado. Configure em Configurações → Azure OpenAI Image Endpoint."
+        print(f"[IMAGE] Skipping image generation: {image_error}")
+    else:
         image_prompt = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}. Main subject: {main_subject}"
         if ch.image_generation_prompt:
             image_prompt += f"\n\nItem específico: {main_subject}"
@@ -2109,7 +2114,7 @@ Return only the post text."""
             img_bytes = _generate_image_bytes(image_prompt, ch, s, db)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
-            
+
             # Track image generation credits
             image_model = ch.image_model or "mai"
             total_credits += register_credit_usage(
@@ -2124,6 +2129,7 @@ Return only the post text."""
                 metadata={"prompt_length": len(image_prompt)},
             )
         except Exception as e:
+            image_error = str(e)
             print(f"Image generation failed: {e}")
 
     p = PostDB(
@@ -2146,7 +2152,7 @@ Return only the post text."""
     )
     db.commit()
 
-    return Post(id=post_id, text=post_text, image_url=blob_url)
+    return Post(id=post_id, text=post_text, image_url=blob_url, image_error=image_error)
 
 
 @app.post("/api/posts/{post_id}/image/upload")
