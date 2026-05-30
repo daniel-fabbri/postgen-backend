@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, PlainTextResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from urllib.parse import urlencode
 from pydantic import BaseModel
@@ -3615,7 +3615,6 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = os.getenv("INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "po
 
 @app.get("/api/webhooks/instagram")
 async def instagram_webhook_verify(
-    request: dict = Depends(lambda: {}),
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
@@ -3628,7 +3627,11 @@ async def instagram_webhook_verify(
     
     if hub_mode == "subscribe" and hub_verify_token == INSTAGRAM_WEBHOOK_VERIFY_TOKEN:
         print(f"[WEBHOOK] Verification successful, returning challenge: {hub_challenge}")
-        return int(hub_challenge) if hub_challenge else 200
+        try:
+            return PlainTextResponse(content=hub_challenge)
+        except Exception as e:
+            print(f"[WEBHOOK] Error returning challenge: {e}")
+            return PlainTextResponse(content="200")
     
     print("[WEBHOOK] Verification failed")
     raise HTTPException(status_code=403, detail="Verification token mismatch")
