@@ -3684,9 +3684,16 @@ async def _process_comment_webhook(value: dict, db: Session):
         text = value.get("text", "")
         from_user = value.get("from", {})
         media_id = value.get("media", {}).get("id")
+        parent_id = value.get("parent_id")  # Se tiver parent_id, é uma resposta a outro comentário
         
         if not comment_id or not text:
             print("[WEBHOOK] Comment missing required fields")
+            return
+        
+        # IMPORTANTE: Ignorar respostas (replies) para evitar loop infinito
+        # Só processamos comentários originais no post, não respostas a outros comentários
+        if parent_id:
+            print(f"[WEBHOOK] Ignoring reply comment (parent_id={parent_id}) to prevent loop")
             return
         
         print(f"[WEBHOOK] New comment: id={comment_id}, text={text[:50]}..., media={media_id}")
@@ -3699,12 +3706,6 @@ async def _process_comment_webhook(value: dict, db: Session):
         
         if not channel:
             print("[WEBHOOK] No channel with auto_reply enabled")
-            return
-        
-        # IMPORTANTE: Ignorar comentários da própria conta para evitar loop infinito
-        from_user_id = from_user.get("id")
-        if from_user_id and str(from_user_id) == str(channel.instagram_user_id):
-            print(f"[WEBHOOK] Ignoring comment from own account (prevents loop)")
             return
         
         # Buscar informações do post para contexto
