@@ -299,12 +299,13 @@ def _set_system_config(db: Session, key: str, value: str):
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
-    # Inicializa configurações padrão se não existirem
     db = SessionLocal()
     try:
-        if not db.query(SystemConfigDB).filter(SystemConfigDB.key == "markup_percentage").first():
-            db.add(SystemConfigDB(key="markup_percentage", value="0.0"))
-            db.commit()
+        defaults = {"credits_per_real": "1.0", "initial_credits": "0.0"}
+        for key, val in defaults.items():
+            if not db.query(SystemConfigDB).filter(SystemConfigDB.key == key).first():
+                db.add(SystemConfigDB(key=key, value=val))
+        db.commit()
     finally:
         db.close()
     try:
@@ -476,11 +477,15 @@ class ChannelDashboardOut(BaseModel):
     total_interactions: int
     total_likes: int
     total_comments: int
+    total_saved: int
+    total_shares: int
     avg_engagement_rate: Optional[float]
     top_by_reach: List[DashboardItemOut]
     top_by_engagement: List[DashboardItemOut]
     top_by_likes: List[DashboardItemOut]
     top_by_comments: List[DashboardItemOut]
+    top_by_saved: List[DashboardItemOut]
+    top_by_shares: List[DashboardItemOut]
     last_refreshed: Optional[str]
 
 
@@ -1004,34 +1009,53 @@ def _fetch_and_store_insights(
     result = {}
     ig_media_type = None
     api_base = _ig_api_base(token)
+    
+    print(f"\n[INSIGHTS DEBUG] Fetching insights for {media_type} {media_id} (IG: {ig_media_id})")
+    print(f"[INSIGHTS DEBUG] API Base: {api_base}")
 
     try:
-        resp = requests.get(
-            f"{api_base}/{ig_media_id}",
-            params={"fields": "like_count,comments_count,media_type", "access_token": token},
-            timeout=15,
-        )
+        url = f"{api_base}/{ig_media_id}"
+        params = {"fields": "like_count,comments_count,media_type", "access_token": token}
+        print(f"[INSIGHTS DEBUG] Fetching basic data from: {url}")
+        print(f"[INSIGHTS DEBUG] Fields: like_count,comments_count,media_type")
+        
+        resp = requests.get(url, params=params, timeout=15)
+        print(f"[INSIGHTS DEBUG] Basic fetch status: {resp.status_code}")
+        
         if resp.ok:
             data = resp.json()
+            print(f"[INSIGHTS DEBUG] Basic data received: {data}")
             result["like_count"] = data.get("like_count", 0)
             result["comments_count"] = data.get("comments_count", 0)
             ig_media_type = data.get("media_type", "")
         else:
-            print(f"Insights basic fetch failed {resp.status_code}: {resp.text[:200]}")
+            print(f"[INSIGHTS ERROR] Basic fetch failed {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"Insights basic fetch error: {e}")
+        print(f"[INSIGHTS ERROR] Basic fetch exception: {e}")
+        import traceback
+        traceback.print_exc()
 
     metrics = ["impressions", "reach", "saved", "shares"]
     if ig_media_type in ("VIDEO", "REELS"):
         metrics += ["video_views", "plays"]
+    
+    print(f"[INSIGHTS DEBUG] Fetching advanced metrics: {metrics}")
+    print(f"[INSIGHTS DEBUG] Media type: {ig_media_type}")
+    
     try:
-        ins_resp = requests.get(
-            f"{api_base}/{ig_media_id}/insights",
-            params={"metric": ",".join(metrics), "period": "lifetime", "access_token": token},
-            timeout=15,
-        )
+        ins_url = f"{api_base}/{ig_media_id}/insights"
+        ins_params = {"metric": ",".join(metrics), "period": "lifetime", "access_token": token}
+        print(f"[INSIGHTS DEBUG] Insights URL: {ins_url}")
+        print(f"[INSIGHTS DEBUG] Metrics param: {','.join(metrics)}")
+        
+        ins_resp = requests.get(ins_url, params=ins_params, timeout=15)
+        print(f"[INSIGHTS DEBUG] Advanced fetch status: {ins_resp.status_code}")
+        
         if ins_resp.ok:
-            for item in ins_resp.json().get("data", []):
+            ins_data = ins_resp.json()
+            print(f"[INSIGHTS DEBUG] Advanced data received: {ins_data}")
+            
+            for item in ins_data.get("data", []):
                 name = item.get("name", "")
                 val = item.get("value")
                 if val is None:
@@ -1041,15 +1065,27 @@ def _fetch_and_store_insights(
                     total = item.get("total_value", {})
                     val = total.get("value", 0) if isinstance(total, dict) else 0
                 result[name] = val or 0
+                print(f"[INSIGHTS DEBUG] Metric {name} = {val}")
         else:
-            print(f"Insights advanced fetch failed {ins_resp.status_code}: {ins_resp.text[:200]}")
+            error_text = ins_resp.text
+            print(f"[INSIGHTS ERROR] Advanced fetch failed {ins_resp.status_code}: {error_text}")
+            try:
+                error_json = ins_resp.json()
+                print(f"[INSIGHTS ERROR] Error details: {error_json}")
+            except:
+                pass
     except Exception as e:
-        print(f"Insights advanced fetch skipped: {e}")
+        print(f"[INSIGHTS ERROR] Advanced fetch exception: {e}")
+        import traceback
+        traceback.print_exc()
 
     interactions = (result.get("like_count", 0) + result.get("comments_count", 0) + result.get("saved", 0))
     result["total_interactions"] = interactions
     reach = result.get("reach")
     result["engagement_rate"] = round(interactions / reach * 100, 2) if reach else None
+    
+    print(f"[INSIGHTS DEBUG] Final result: {result}")
+    print(f"[INSIGHTS DEBUG] Engagement rate: {result['engagement_rate']}")
 
     now = datetime.now(timezone.utc)
     ins = db.query(MediaInsightsDB).filter(
@@ -1136,10 +1172,12 @@ def root():
 def register(data: UserRegister, db: Session = Depends(get_db)):
     if db.query(UserDB).filter(UserDB.email == data.email).first():
         raise HTTPException(status_code=409, detail="E-mail já cadastrado")
+    initial_credits = float(_get_system_config(db, "initial_credits", "0.0"))
     user = UserDB(
         email=data.email,
         password_hash=hash_password(data.password),
         name=data.name,
+        credits_balance=initial_credits,
     )
     db.add(user)
     db.commit()
@@ -1212,9 +1250,9 @@ def get_rates(
     db: Session = Depends(get_db),
 ):
     _require_admin(current_user)
-    markup = float(_get_system_config(db, "markup_percentage", "0.0"))
-    credits_per_real = round(1 / (1 + markup / 100), 6) if markup > -100 else 0
-    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
+    credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
+    initial_credits = float(_get_system_config(db, "initial_credits", "0.0"))
+    return {"credits_per_real": credits_per_real, "initial_credits": initial_credits}
 
 
 @app.put("/api/admin/rates")
@@ -1224,20 +1262,21 @@ def update_rates(
     db: Session = Depends(get_db),
 ):
     _require_admin(current_user)
-    markup = float(payload.get("markup_percentage", 0))
-    if markup < 0:
-        raise HTTPException(status_code=422, detail="Markup não pode ser negativo")
-    _set_system_config(db, "markup_percentage", str(markup))
-    credits_per_real = round(1 / (1 + markup / 100), 6)
-    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
+    credits_per_real = float(payload.get("credits_per_real", 1.0))
+    initial_credits = float(payload.get("initial_credits", 0.0))
+    if credits_per_real <= 0:
+        raise HTTPException(status_code=422, detail="credits_per_real deve ser positivo")
+    if initial_credits < 0:
+        raise HTTPException(status_code=422, detail="initial_credits não pode ser negativo")
+    _set_system_config(db, "credits_per_real", str(credits_per_real))
+    _set_system_config(db, "initial_credits", str(initial_credits))
+    return {"credits_per_real": credits_per_real, "initial_credits": initial_credits}
 
 
 @app.get("/api/payments/rates")
 def get_public_rates(db: Session = Depends(get_db)):
-    """Retorna a taxa de conversão atual (público)"""
-    markup = float(_get_system_config(db, "markup_percentage", "0.0"))
-    credits_per_real = round(1 / (1 + markup / 100), 6) if markup > -100 else 0
-    return {"markup_percentage": markup, "credits_per_real": credits_per_real}
+    credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
+    return {"credits_per_real": credits_per_real}
 
 
 # ---------------------------------------------------------------------------
@@ -1256,8 +1295,8 @@ def create_payment(
     try:
         sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
 
-        markup = float(_get_system_config(db, "markup_percentage", "0.0"))
-        credits_amount = round(payment_data.amount / (1 + markup / 100), 2)
+        credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
+        credits_amount = round(payment_data.amount * credits_per_real, 2)
 
         payment_request = {
             "transaction_amount": float(payment_data.amount),
@@ -1298,7 +1337,7 @@ def create_payment(
             "payment_id": db_payment.id,
             "mp_payment_id": mp_payment_id,
             "amount": payment_data.amount,
-            "credits_amount": payment_data.amount,
+            "credits_amount": credits_amount,
             "status": "pending",
             "qr_code": qr_code_base64,
             "qr_code_data": qr_code_data,
@@ -1333,28 +1372,50 @@ async def payment_webhook(
         # Consultar status atualizado no Mercado Pago
         sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
         payment_info = sdk.payment().get(mp_payment_id)
-        
+
         if payment_info["status"] != 200:
             return {"status": "error", "message": "Failed to get payment info"}
-        
+
         mp_status = payment_info["response"].get("status", "")
-        
-        # Atualizar status no banco
-        payment.status = mp_status
-        payment.updated_at = func.now()
-        
-        # Se aprovado, adicionar créditos ao usuário
-        if mp_status == "approved" and payment.status != "approved":
-            user = db.query(UserDB).filter(UserDB.id == payment.user_id).first()
-            if user:
+        old_status = payment.status
+
+        user = db.query(UserDB).filter(UserDB.id == payment.user_id).first()
+        if user:
+            if mp_status == "approved" and old_status != "approved":
                 user.credits_balance += payment.credits_amount
-        
+            elif old_status == "approved" and mp_status in ("cancelled", "refunded", "charged_back"):
+                user.credits_balance = max(0.0, user.credits_balance - payment.credits_amount)
+
+        payment.status = mp_status
         db.commit()
-        
+
         return {"status": "success", "payment_status": mp_status}
-    
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/payments/my")
+def list_my_payments(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    payments = (
+        db.query(PaymentDB)
+        .filter(PaymentDB.user_id == current_user.id)
+        .order_by(PaymentDB.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": p.id,
+            "amount": p.amount,
+            "credits_amount": p.credits_amount,
+            "status": p.status,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in payments
+    ]
 
 
 @app.get("/api/payments/{payment_id}")
@@ -1386,16 +1447,33 @@ def get_payment_status(
                 payment.status = mp_status
                 payment.updated_at = func.now()
                 
-                # Se aprovado agora, adicionar créditos
                 if mp_status == "approved" and old_status != "approved":
                     current_user.credits_balance += payment.credits_amount
-                
+                elif old_status == "approved" and mp_status in ("cancelled", "refunded", "charged_back"):
+                    current_user.credits_balance = max(0.0, current_user.credits_balance - payment.credits_amount)
+
                 db.commit()
                 db.refresh(payment)
     except Exception:
-        pass  # Se falhar, retorna o status atual do banco
-    
+        pass
+
     return PaymentOut.model_validate(payment)
+
+
+@app.post("/api/admin/users/{user_id}/reset-credits")
+def admin_reset_credits(
+    user_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(current_user)
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    user.credits_balance = 0.0
+    db.execute(text("DELETE FROM credit_usage WHERE user_id = :uid"), {"uid": user_id})
+    db.commit()
+    return {"ok": True, "user_id": user_id}
 
 
 # ---------------------------------------------------------------------------
@@ -3009,7 +3087,7 @@ def upload_reference_image(
 
     # Auto-describe via vision model
     description = None
-    s = db.query(SettingsDB).filter(SettingsDB.user_id == current_user.id).first()
+    s = get_or_create_settings(current_user, db)
     if s and s.azure_openai_endpoint and s.azure_openai_api_key:
         try:
             client = get_azure_client(s)
@@ -3231,6 +3309,8 @@ def get_channel_dashboard(
     total_interactions = sum(i.insights.total_interactions for i in items)
     total_likes = sum(i.insights.like_count for i in items)
     total_comments = sum(i.insights.comments_count for i in items)
+    total_saved = sum(i.insights.saved or 0 for i in items)
+    total_shares = sum(i.insights.shares or 0 for i in items)
     rates = [i.insights.engagement_rate for i in items if i.insights.engagement_rate is not None]
     avg_rate = round(sum(rates) / len(rates), 2) if rates else None
 
@@ -3238,6 +3318,8 @@ def get_channel_dashboard(
     top_by_engagement = sorted(items, key=lambda x: x.insights.engagement_rate or 0.0, reverse=True)[:5]
     top_by_likes = sorted(items, key=lambda x: x.insights.like_count, reverse=True)[:5]
     top_by_comments = sorted(items, key=lambda x: x.insights.comments_count, reverse=True)[:5]
+    top_by_saved = sorted(items, key=lambda x: x.insights.saved or 0, reverse=True)[:5]
+    top_by_shares = sorted(items, key=lambda x: x.insights.shares or 0, reverse=True)[:5]
 
     all_ins = list(insights_map.values())
     last_refreshed = None
@@ -3255,11 +3337,15 @@ def get_channel_dashboard(
         total_interactions=total_interactions,
         total_likes=total_likes,
         total_comments=total_comments,
+        total_saved=total_saved,
+        total_shares=total_shares,
         avg_engagement_rate=avg_rate,
         top_by_reach=top_by_reach,
         top_by_engagement=top_by_engagement,
         top_by_likes=top_by_likes,
         top_by_comments=top_by_comments,
+        top_by_saved=top_by_saved,
+        top_by_shares=top_by_shares,
         last_refreshed=last_refreshed,
     )
 
@@ -3375,6 +3461,7 @@ def get_credits_summary(
     
     return {
         "total_credits": total_credits,
+        "credits_balance": current_user.credits_balance,
         "by_operation": [{"operation_type": row[0], "credits": float(row[1] or 0.0)} for row in by_operation],
         "by_channel": [{"channel_id": row[1], "channel_name": row[0], "credits": float(row[2] or 0.0)} for row in by_channel],
         "by_resource": [{"resource_type": row[0], "credits": float(row[1] or 0.0)} for row in by_resource],
