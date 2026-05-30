@@ -3701,6 +3701,12 @@ async def _process_comment_webhook(value: dict, db: Session):
             print("[WEBHOOK] No channel with auto_reply enabled")
             return
         
+        # IMPORTANTE: Ignorar comentários da própria conta para evitar loop infinito
+        from_user_id = from_user.get("id")
+        if from_user_id and str(from_user_id) == str(channel.instagram_user_id):
+            print(f"[WEBHOOK] Ignoring comment from own account (prevents loop)")
+            return
+        
         # Buscar informações do post para contexto
         post_context = ""
         post_db = db.query(PostDB).filter(PostDB.ig_media_id == media_id).first()
@@ -3758,6 +3764,12 @@ async def _process_message_webhook(value: dict, db: Session):
         
         if not channel:
             print("[WEBHOOK] No channel with auto_reply enabled")
+            return
+        
+        # IMPORTANTE: Ignorar mensagens da própria conta para evitar loop infinito
+        from_user_id = from_user.get("id")
+        if from_user_id and str(from_user_id) == str(channel.instagram_user_id):
+            print(f"[WEBHOOK] Ignoring message from own account (prevents loop)")
             return
         
         # Gerar resposta com AI
