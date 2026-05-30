@@ -1035,49 +1035,60 @@ def _fetch_and_store_insights(
         import traceback
         traceback.print_exc()
 
-    metrics = ["impressions", "reach", "saved", "shares"]
+    # Tentar métricas em grupos menores para evitar erros da API
+    # Diferentes tipos de mídia suportam diferentes métricas
+    # NOTA: A API do Instagram NÃO fornece 'impressions' para posts IMAGE/VIDEO normais
+    # Apenas Stories e Reels têm essa métrica disponível
+    metrics_to_try = []
+    
     if ig_media_type in ("VIDEO", "REELS"):
-        metrics += ["video_views", "plays"]
+        # Vídeos e Reels - removido impressions/video_views/plays pois não são suportados
+        metrics_to_try = [
+            ["reach", "saved"],
+            ["shares"]
+        ]
+    else:
+        # IMAGE e CAROUSEL_ALBUM - removido impressions pois não é suportado
+        metrics_to_try = [
+            ["reach", "saved"],
+            ["shares"]
+        ]
     
-    print(f"[INSIGHTS DEBUG] Fetching advanced metrics: {metrics}")
     print(f"[INSIGHTS DEBUG] Media type: {ig_media_type}")
+    print(f"[INSIGHTS DEBUG] Will try metric groups: {metrics_to_try}")
     
-    try:
-        ins_url = f"{api_base}/{ig_media_id}/insights"
-        ins_params = {"metric": ",".join(metrics), "period": "lifetime", "access_token": token}
-        print(f"[INSIGHTS DEBUG] Insights URL: {ins_url}")
-        print(f"[INSIGHTS DEBUG] Metrics param: {','.join(metrics)}")
-        
-        ins_resp = requests.get(ins_url, params=ins_params, timeout=15)
-        print(f"[INSIGHTS DEBUG] Advanced fetch status: {ins_resp.status_code}")
-        
-        if ins_resp.ok:
-            ins_data = ins_resp.json()
-            print(f"[INSIGHTS DEBUG] Advanced data received: {ins_data}")
+    # Tentar cada grupo de métricas
+    for metric_group in metrics_to_try:
+        try:
+            ins_url = f"{api_base}/{ig_media_id}/insights"
+            ins_params = {"metric": ",".join(metric_group), "period": "lifetime", "access_token": token}
+            print(f"[INSIGHTS DEBUG] Trying metrics: {metric_group}")
             
-            for item in ins_data.get("data", []):
-                name = item.get("name", "")
-                val = item.get("value")
-                if val is None:
-                    vals = item.get("values", [])
-                    val = vals[0].get("value", 0) if vals else 0
-                if val is None:
-                    total = item.get("total_value", {})
-                    val = total.get("value", 0) if isinstance(total, dict) else 0
-                result[name] = val or 0
-                print(f"[INSIGHTS DEBUG] Metric {name} = {val}")
-        else:
-            error_text = ins_resp.text
-            print(f"[INSIGHTS ERROR] Advanced fetch failed {ins_resp.status_code}: {error_text}")
-            try:
-                error_json = ins_resp.json()
-                print(f"[INSIGHTS ERROR] Error details: {error_json}")
-            except:
-                pass
-    except Exception as e:
-        print(f"[INSIGHTS ERROR] Advanced fetch exception: {e}")
-        import traceback
-        traceback.print_exc()
+            ins_resp = requests.get(ins_url, params=ins_params, timeout=15)
+            print(f"[INSIGHTS DEBUG] Status: {ins_resp.status_code}")
+            
+            if ins_resp.ok:
+                ins_data = ins_resp.json()
+                print(f"[INSIGHTS DEBUG] Success! Data: {ins_data}")
+                
+                for item in ins_data.get("data", []):
+                    name = item.get("name", "")
+                    val = item.get("value")
+                    if val is None:
+                        vals = item.get("values", [])
+                        val = vals[0].get("value", 0) if vals else 0
+                    if val is None:
+                        total = item.get("total_value", {})
+                        val = total.get("value", 0) if isinstance(total, dict) else 0
+                    result[name] = val or 0
+                    print(f"[INSIGHTS DEBUG] Metric {name} = {val}")
+            else:
+                error_text = ins_resp.text
+                print(f"[INSIGHTS DEBUG] Group failed {ins_resp.status_code}: {error_text[:200]}")
+                # Continue tentando outras métricas
+        except Exception as e:
+            print(f"[INSIGHTS DEBUG] Exception trying {metric_group}: {e}")
+            # Continue tentando outras métricas
 
     interactions = (result.get("like_count", 0) + result.get("comments_count", 0) + result.get("saved", 0))
     result["total_interactions"] = interactions
