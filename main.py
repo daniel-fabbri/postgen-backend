@@ -94,6 +94,8 @@ class ChannelDB(Base):
     instagram_user_id = Column(String(255), nullable=True)
     instagram_access_token = Column(Text, nullable=True)
     image_model = Column(String(20), default="mai")   # "mai" | "gpt-image-2"
+    auto_reply_enabled = Column(Boolean, default=False)  # Respostas automáticas via webhook
+    auto_reply_prompt = Column(Text, nullable=True)  # Prompt personalizado para respostas automáticas
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user = relationship("UserDB", back_populates="channels")
     posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
@@ -429,6 +431,8 @@ class Channel(BaseModel):
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
     image_model: Optional[str] = "mai"
+    auto_reply_enabled: Optional[bool] = False
+    auto_reply_prompt: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -881,6 +885,8 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
         instagram_user_id=ch.instagram_user_id,
         instagram_access_token="***" if ch.instagram_access_token else None,
         image_model=ch.image_model or "mai",
+        auto_reply_enabled=ch.auto_reply_enabled or False,
+        auto_reply_prompt=ch.auto_reply_prompt,
     )
 
 
@@ -1621,6 +1627,9 @@ def update_channel(
         ch.instagram_access_token = data.instagram_access_token
     if data.image_model:
         ch.image_model = data.image_model
+    if data.auto_reply_enabled is not None:
+        ch.auto_reply_enabled = data.auto_reply_enabled
+    ch.auto_reply_prompt = data.auto_reply_prompt
     db.commit()
     db.refresh(ch)
     return channel_to_schema(ch)
@@ -3593,6 +3602,313 @@ def get_channel_credits(
             } for row in recent_resources
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Instagram Webhooks - Respostas Automáticas
+# ---------------------------------------------------------------------------
+
+INSTAGRAM_WEBHOOK_VERIFY_TOKEN = os.getenv("INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "postgen_webhook_secret_2026")
+
+
+@app.get("/api/webhooks/instagram")
+async def instagram_webhook_verify(
+    request: dict = Depends(lambda: {}),
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+):
+    """
+    Endpoint de verificação do webhook do Instagram.
+    O Instagram envia uma requisição GET para validar o webhook.
+    """
+    print(f"[WEBHOOK] Verification request: mode={hub_mode}, token={hub_verify_token}")
+    
+    if hub_mode == "subscribe" and hub_verify_token == INSTAGRAM_WEBHOOK_VERIFY_TOKEN:
+        print(f"[WEBHOOK] Verification successful, returning challenge: {hub_challenge}")
+        return int(hub_challenge) if hub_challenge else 200
+    
+    print("[WEBHOOK] Verification failed")
+    raise HTTPException(status_code=403, detail="Verification token mismatch")
+
+
+@app.post("/api/webhooks/instagram")
+async def instagram_webhook_receive(
+    body: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    Endpoint para receber notificações de webhooks do Instagram.
+    Processa comentários e mensagens para resposta automática.
+    """
+    print(f"[WEBHOOK] Received event: {json.dumps(body, indent=2)}")
+    
+    try:
+        # Instagram envia o payload na estrutura: body["entry"][0]["changes"]
+        if "entry" not in body:
+            return {"status": "ignored", "reason": "no entry"}
+        
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                field = change.get("field")
+                value = change.get("value")
+                
+                print(f"[WEBHOOK] Processing field={field}, value={json.dumps(value)}")
+                
+                # Processar comentários
+                if field == "comments":
+                    await _process_comment_webhook(value, db)
+                
+                # Processar mensagens (DMs)
+                elif field == "messages":
+                    await _process_message_webhook(value, db)
+        
+        return {"status": "processed"}
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+async def _process_comment_webhook(value: dict, db: Session):
+    """Processa webhook de comentário no Instagram"""
+    try:
+        comment_id = value.get("id")
+        text = value.get("text", "")
+        from_user = value.get("from", {})
+        media_id = value.get("media", {}).get("id")
+        
+        if not comment_id or not text:
+            print("[WEBHOOK] Comment missing required fields")
+            return
+        
+        print(f"[WEBHOOK] New comment: id={comment_id}, text={text[:50]}..., media={media_id}")
+        
+        # Buscar canal que tem esse media_id
+        channel = db.query(ChannelDB).filter(
+            ChannelDB.instagram_access_token.isnot(None),
+            ChannelDB.auto_reply_enabled == True,
+        ).first()
+        
+        if not channel:
+            print("[WEBHOOK] No channel with auto_reply enabled")
+            return
+        
+        # Buscar informações do post para contexto
+        post_context = ""
+        post_db = db.query(PostDB).filter(PostDB.ig_media_id == media_id).first()
+        if post_db:
+            post_context = f"Post: {post_db.text[:200]}"
+        
+        # Gerar resposta com AI
+        reply_text = await _generate_ai_reply(
+            channel=channel,
+            user_message=text,
+            context=post_context,
+            message_type="comment"
+        )
+        
+        if not reply_text:
+            print("[WEBHOOK] Failed to generate reply")
+            return
+        
+        # Enviar resposta via Instagram API
+        success = await _send_instagram_comment_reply(
+            comment_id=comment_id,
+            reply_text=reply_text,
+            access_token=channel.instagram_access_token
+        )
+        
+        if success:
+            print(f"[WEBHOOK] Successfully replied to comment {comment_id}")
+        else:
+            print(f"[WEBHOOK] Failed to send reply to comment {comment_id}")
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] process_comment: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _process_message_webhook(value: dict, db: Session):
+    """Processa webhook de mensagem (DM) no Instagram"""
+    try:
+        message_id = value.get("id")
+        text = value.get("text", "")
+        from_user = value.get("from", {})
+        
+        if not message_id or not text:
+            print("[WEBHOOK] Message missing required fields")
+            return
+        
+        print(f"[WEBHOOK] New message: id={message_id}, text={text[:50]}...")
+        
+        # Buscar canal com auto_reply ativado
+        channel = db.query(ChannelDB).filter(
+            ChannelDB.instagram_access_token.isnot(None),
+            ChannelDB.auto_reply_enabled == True,
+        ).first()
+        
+        if not channel:
+            print("[WEBHOOK] No channel with auto_reply enabled")
+            return
+        
+        # Gerar resposta com AI
+        reply_text = await _generate_ai_reply(
+            channel=channel,
+            user_message=text,
+            context=f"Canal: {channel.name}. Objetivo: {channel.objective}",
+            message_type="dm"
+        )
+        
+        if not reply_text:
+            print("[WEBHOOK] Failed to generate reply")
+            return
+        
+        # Enviar resposta via Instagram API
+        success = await _send_instagram_message_reply(
+            recipient_id=from_user.get("id"),
+            reply_text=reply_text,
+            instagram_user_id=channel.instagram_user_id,
+            access_token=channel.instagram_access_token
+        )
+        
+        if success:
+            print(f"[WEBHOOK] Successfully replied to message {message_id}")
+        else:
+            print(f"[WEBHOOK] Failed to send reply to message {message_id}")
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] process_message: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _generate_ai_reply(
+    channel: ChannelDB,
+    user_message: str,
+    context: str,
+    message_type: str  # "comment" or "dm"
+) -> Optional[str]:
+    """Gera uma resposta automática usando AI"""
+    try:
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+        api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+        
+        if not endpoint or not api_key:
+            print("[WEBHOOK] Azure OpenAI not configured")
+            return None
+        
+        client = AzureOpenAI(
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version="2024-08-01-preview"
+        )
+        
+        # Usar prompt personalizado se configurado, caso contrário usar o padrão
+        if channel.auto_reply_prompt and channel.auto_reply_prompt.strip():
+            system_prompt = channel.auto_reply_prompt
+        else:
+            # Prompt padrão
+            system_prompt = f"""Você é um assistente que responde {message_type}s no Instagram para o canal "{channel.name}".
+
+Objetivo do canal: {channel.objective}
+
+Instruções:
+- Seja amigável, natural e conversacional
+- Responda de forma breve e direta (máximo 2-3 frases)
+- Use emojis moderadamente quando apropriado
+- Se for um elogio, agradeça com entusiasmo
+- Se for uma pergunta, responda de forma útil
+- Se for crítica construtiva, agradeça pelo feedback
+- Mantenha o tom alinhado com o objetivo do canal
+- NÃO use hashtags na resposta
+"""
+        
+        user_prompt = f"""{context}
+
+Mensagem do usuário: "{user_message}"
+
+Gere uma resposta apropriada:"""
+        
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=150,
+            temperature=0.7,
+        )
+        
+        reply = response.choices[0].message.content.strip()
+        print(f"[WEBHOOK] Generated reply: {reply}")
+        return reply
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] generate_ai_reply: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+async def _send_instagram_comment_reply(
+    comment_id: str,
+    reply_text: str,
+    access_token: str
+) -> bool:
+    """Envia resposta a um comentário no Instagram via API"""
+    try:
+        url = f"https://graph.instagram.com/v21.0/{comment_id}/replies"
+        payload = {
+            "message": reply_text,
+            "access_token": access_token
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        if response.ok:
+            print(f"[WEBHOOK] Comment reply sent successfully: {response.json()}")
+            return True
+        else:
+            print(f"[WEBHOOK ERROR] Failed to send comment reply: {response.status_code} {response.text}")
+            return False
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] send_instagram_comment_reply: {e}")
+        return False
+
+
+async def _send_instagram_message_reply(
+    recipient_id: str,
+    reply_text: str,
+    instagram_user_id: str,
+    access_token: str
+) -> bool:
+    """Envia resposta a uma mensagem (DM) no Instagram via API"""
+    try:
+        url = f"https://graph.instagram.com/v21.0/{instagram_user_id}/messages"
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {"text": reply_text},
+            "access_token": access_token
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        if response.ok:
+            print(f"[WEBHOOK] Message reply sent successfully: {response.json()}")
+            return True
+        else:
+            print(f"[WEBHOOK ERROR] Failed to send message reply: {response.status_code} {response.text}")
+            return False
+    
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] send_instagram_message_reply: {e}")
+        return False
 
 
 if __name__ == "__main__":
