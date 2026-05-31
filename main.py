@@ -4,9 +4,7 @@ from fastapi.responses import RedirectResponse, PlainTextResponse
 from urllib.parse import urlencode
 from typing import Optional, List
 import os
-import base64
 import json
-import shutil
 import subprocess
 import tempfile
 import requests
@@ -14,36 +12,37 @@ from datetime import datetime, timedelta, timezone
 from openai import AzureOpenAI
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from azure.storage.blob import BlobServiceClient, ContentSettings
-import mercadopago
 
 from config import (
-    BASE_URL, BASE_DIR, ALLOWED_ORIGINS,
-    AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER,
+    BASE_URL, ALLOWED_ORIGINS,
     AZURE_SORA_ENDPOINT, AZURE_SORA_API_KEY,
-    GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY,
     INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET, FRONTEND_URL,
-    MERCADOPAGO_ACCESS_TOKEN, INSTAGRAM_WEBHOOK_VERIFY_TOKEN,
+    INSTAGRAM_WEBHOOK_VERIFY_TOKEN,
 )
 from database import engine, SessionLocal, Base, get_db
 from models import (
     UserDB, ChannelDB, PostDB, VideoDB, VideoProjectDB, MediaInsightsDB,
-    ReferenceImageDB, AvatarDB, SettingsDB, CreditUsageDB, SystemConfigDB, PaymentDB,
+    ReferenceImageDB, AvatarDB, SystemConfigDB,
 )
 from schemas import (
-    UserRegister, UserLogin, UserOut, UserUpdate, TokenOut, Settings, Channel,
-    GeneratePostRequest, Post, InsightsOut, DashboardItemOut, ChannelDashboardOut,
-    SavedPost, GenerateAvatarRequest, UpdateAvatarRequest, TestInstagramRequest,
-    GenerateVideoRequest, SavedVideo, UpdateVideoCaptionRequest, VideoProjectOut,
-    CreateVideoProjectRequest, UpdateVideoProjectClipsRequest, GenerateProjectClipRequest,
-    AddVideoToProjectRequest, ReferenceImageOut, AvatarInfo, UpdatePostRequest,
-    GeneratePostImageRequest, CreditUsageOut, PaymentCreate, PaymentOut,
+    Channel, GeneratePostRequest, Post, InsightsOut, DashboardItemOut,
+    ChannelDashboardOut, SavedPost, GenerateAvatarRequest, UpdateAvatarRequest,
+    TestInstagramRequest, GenerateVideoRequest, SavedVideo, UpdateVideoCaptionRequest,
+    VideoProjectOut, CreateVideoProjectRequest, UpdateVideoProjectClipsRequest,
+    GenerateProjectClipRequest, AddVideoToProjectRequest, ReferenceImageOut, AvatarInfo,
+    UpdatePostRequest, GeneratePostImageRequest,
 )
 from dependencies import (
-    hash_password, verify_password, create_access_token,
-    get_current_user, _require_admin, get_or_create_settings, get_azure_client,
-    get_channel_or_404,
+    get_current_user, get_or_create_settings, get_azure_client, get_channel_or_404,
 )
+from services.blob_storage import upload_bytes_to_blob
+from services.credits import register_credit_usage
+from services.azure_ai import generate_image_bytes, get_reference_context
+from routers.auth import router as auth_router, users_router
+from routers.admin import router as admin_router
+from routers.settings import router as settings_router
+from routers.payments import router as payments_router
+from routers.credits import router as credits_router
 
 
 app = FastAPI(title="PostGen API")
@@ -56,42 +55,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------------------------------
-# Blob storage helpers
-# ---------------------------------------------------------------------------
-def _blob_client():
-    if not AZURE_STORAGE_CONNECTION_STRING:
-        raise HTTPException(status_code=500, detail="Azure Storage não configurado")
-    return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-
-
-def upload_bytes_to_blob(data: bytes, blob_name: str, content_type: str = "image/png") -> str:
-    client = _blob_client()
-    container = client.get_container_client(AZURE_STORAGE_CONTAINER)
-    blob = container.get_blob_client(blob_name)
-    blob.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type=content_type))
-    return blob.url
-
-
-def upload_file_to_blob(file_path: str, blob_name: str, content_type: str = "image/png") -> str:
-    with open(file_path, "rb") as f:
-        data = f.read()
-    return upload_bytes_to_blob(data, blob_name, content_type)
-
-
-def _get_system_config(db: Session, key: str, default: str = "") -> str:
-    row = db.query(SystemConfigDB).filter(SystemConfigDB.key == key).first()
-    return row.value if row else default
-
-
-def _set_system_config(db: Session, key: str, value: str):
-    row = db.query(SystemConfigDB).filter(SystemConfigDB.key == key).first()
-    if row:
-        row.value = value
-    else:
-        db.add(SystemConfigDB(key=key, value=value))
-    db.commit()
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(admin_router)
+app.include_router(settings_router)
+app.include_router(payments_router)
+app.include_router(credits_router)
 
 
 @app.on_event("startup")
@@ -169,137 +138,8 @@ def on_startup():
 
 
 # ---------------------------------------------------------------------------
-# Credit tracking utilities
+# Conversion helpers
 # ---------------------------------------------------------------------------
-
-# Tabela de custos aproximados por 1000 tokens (em créditos)
-# Baseado nos preços da Azure OpenAI e outros serviços
-CREDIT_COSTS = {
-    # Modelos de texto
-    "gpt-4o": {"input": 2.5, "output": 10.0},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
-    "gpt-4": {"input": 30.0, "output": 60.0},
-    "gpt-35-turbo": {"input": 0.5, "output": 1.5},
-    
-    # Modelos de imagem (custo por imagem)
-    "dall-e-3": {"per_image": 40.0},
-    "dall-e-2": {"per_image": 20.0},
-    "mai": {"per_image": 30.0},  # MAI Image 2e
-    "gpt-image-2": {"per_image": 35.0},
-    
-    # Modelos de vídeo (custo por segundo)
-    "sora-2": {"per_second": 50.0},
-    
-    # TTS (custo por 1000 caracteres)
-    "tts": {"per_1k_chars": 15.0},
-}
-
-
-def calculate_credits(
-    operation_type: str,
-    model_name: str,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    images_count: int = 0,
-    video_seconds: int = 0,
-    text_length: int = 0,
-) -> float:
-    """
-    Calcula créditos consumidos baseado na operação e modelo usado.
-    """
-    credits = 0.0
-    
-    # Normalizar nome do modelo
-    model_key = model_name.lower()
-    for key in CREDIT_COSTS.keys():
-        if key in model_key:
-            model_key = key
-            break
-    
-    if model_key not in CREDIT_COSTS:
-        model_key = "gpt-4o-mini"  # fallback
-    
-    costs = CREDIT_COSTS[model_key]
-    
-    if operation_type == "text_generation":
-        credits = (input_tokens / 1000.0 * costs.get("input", 0)) + \
-                  (output_tokens / 1000.0 * costs.get("output", 0))
-    
-    elif operation_type == "image_generation":
-        credits = images_count * costs.get("per_image", 30.0)
-    
-    elif operation_type == "video_generation":
-        credits = video_seconds * costs.get("per_second", 50.0)
-    
-    elif operation_type == "tts":
-        credits = (text_length / 1000.0) * costs.get("per_1k_chars", 15.0)
-    
-    return round(credits, 4)
-
-
-def register_credit_usage(
-    db: Session,
-    user_id: int,
-    channel_id: Optional[str],
-    resource_type: str,
-    resource_id: Optional[str],
-    operation_type: str,
-    model_name: str,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    images_count: int = 0,
-    video_seconds: int = 0,
-    text_length: int = 0,
-    metadata: dict = None,
-) -> float:
-    """
-    Registra uso de créditos no banco de dados e retorna o valor consumido.
-    """
-    total_tokens = input_tokens + output_tokens
-    
-    credits = calculate_credits(
-        operation_type=operation_type,
-        model_name=model_name,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        images_count=images_count,
-        video_seconds=video_seconds,
-        text_length=text_length,
-    )
-    
-    usage = CreditUsageDB(
-        user_id=user_id,
-        channel_id=channel_id,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        operation_type=operation_type,
-        model_name=model_name,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
-        credits_consumed=credits,
-        meta_info=json.dumps(metadata or {}),
-    )
-    
-    db.add(usage)
-    db.commit()
-    
-    return credits
-
-
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-def save_image_from_base64(base64_data: str, post_id: str) -> str:
-    """Upload base64 image to blob storage, return blob URL."""
-    if base64_data.startswith("data:image"):
-        base64_data = base64_data.split(",")[1]
-    image_bytes = base64.b64decode(base64_data)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    blob_name = f"posts/{post_id}_{ts}.png"
-    return upload_bytes_to_blob(image_bytes, blob_name, "image/png")
-
-
 def channel_to_schema(ch: ChannelDB) -> Channel:
     return Channel(
         id=ch.id,
@@ -316,82 +156,6 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
         auto_reply_enabled=ch.auto_reply_enabled or False,
         auto_reply_prompt=ch.auto_reply_prompt,
     )
-
-
-def _generate_image_bytes(
-    prompt: str, ch: Optional["ChannelDB"], s: "SettingsDB", db: Session,
-    width: int = 1024, height: int = 1024,
-) -> bytes:
-    """Route image generation to the correct model for the channel. Falls back to MAI if ch is None."""
-    model = (ch.image_model or "mai") if ch else "mai"
-
-    if model == "gpt-image-2":
-        if not GPT_IMAGE_2_API_KEY:
-            raise HTTPException(status_code=400, detail="GPT_IMAGE_2_API_KEY não configurado no servidor")
-        from openai import AzureOpenAI as _AzOAI
-        import io as _io
-        img_client = _AzOAI(
-            azure_endpoint=GPT_IMAGE_2_ENDPOINT,
-            api_key=GPT_IMAGE_2_API_KEY,
-            api_version="2025-04-01-preview",
-        )
-        # Use images.edit with reference if available, else plain generate
-        refs = db.query(ReferenceImageDB).filter(
-            ReferenceImageDB.channel_id == ch.id,
-        ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
-
-        if refs:
-            try:
-                ref_bytes = requests.get(refs[0].blob_url, timeout=20).content
-                size_str = f"{width}x{height}" if width == height else "1024x1024"
-                result = img_client.images.edit(
-                    model="gpt-image-2",
-                    image=("reference.jpg", _io.BytesIO(ref_bytes), "image/jpeg"),
-                    prompt=prompt,
-                    n=1,
-                    size=size_str,
-                )
-                return base64.b64decode(result.data[0].b64_json)
-            except Exception as e:
-                print(f"gpt-image-2 edit failed, falling back to generate: {e}")
-
-        result = img_client.images.generate(
-            model="gpt-image-2",
-            prompt=prompt,
-            n=1,
-            size="1024x1024",
-        )
-        # Azure AI Foundry returns b64_json by default (no response_format param needed)
-        return base64.b64decode(result.data[0].b64_json)
-
-    else:  # MAI
-        if not s.azure_openai_image_endpoint:
-            raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
-        resp = requests.post(
-            s.azure_openai_image_endpoint,
-            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "width": width, "height": height, "model": s.azure_openai_image_deployment},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("data") or "b64_json" not in result["data"][0]:
-            raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-        return base64.b64decode(result["data"][0]["b64_json"])
-
-
-def _get_reference_context(channel_id: str, db: Session) -> str:
-    """Return a visual reference description string to inject into image prompts."""
-    refs = db.query(ReferenceImageDB).filter(
-        ReferenceImageDB.channel_id == channel_id,
-        ReferenceImageDB.description.isnot(None),
-    ).order_by(ReferenceImageDB.created_at.desc()).limit(3).all()
-    if not refs:
-        return ""
-    descriptions = [r.description for r in refs if r.description]
-    if not descriptions:
-        return ""
-    return "\n\nVisual reference for the person/character in this image: " + " ".join(descriptions)
 
 
 def _insights_to_schema(ins) -> Optional[InsightsOut]:
@@ -601,362 +365,6 @@ def root():
 
 
 # ---------------------------------------------------------------------------
-# Auth endpoints
-# ---------------------------------------------------------------------------
-@app.post("/api/auth/register", response_model=TokenOut, status_code=201)
-def register(data: UserRegister, db: Session = Depends(get_db)):
-    if db.query(UserDB).filter(UserDB.email == data.email).first():
-        raise HTTPException(status_code=409, detail="E-mail já cadastrado")
-    initial_credits = float(_get_system_config(db, "initial_credits", "0.0"))
-    user = UserDB(
-        email=data.email,
-        password_hash=hash_password(data.password),
-        name=data.name,
-        credits_balance=initial_credits,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    token = create_access_token(user.email)
-    return TokenOut(access_token=token, user=UserOut.model_validate(user))
-
-
-@app.post("/api/auth/login", response_model=TokenOut)
-def login(data: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.email == data.email).first()
-    if not user or not verify_password(data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
-    token = create_access_token(user.email)
-    return TokenOut(access_token=token, user=UserOut.model_validate(user))
-
-
-@app.get("/api/auth/me", response_model=UserOut)
-def me(current_user: UserDB = Depends(get_current_user)):
-    return UserOut.model_validate(current_user)
-
-
-# ---------------------------------------------------------------------------
-# User endpoints
-# ---------------------------------------------------------------------------
-@app.put("/api/users/profile", response_model=UserOut)
-def update_profile(
-    data: UserUpdate,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Atualiza o perfil do usuário atual"""
-    # Verificar se o email já está em uso por outro usuário
-    if data.email != current_user.email:
-        existing = db.query(UserDB).filter(
-            UserDB.email == data.email,
-            UserDB.id != current_user.id
-        ).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="E-mail já está em uso")
-    
-    current_user.name = data.name
-    current_user.email = data.email
-    db.commit()
-    db.refresh(current_user)
-    return UserOut.model_validate(current_user)
-
-
-@app.get("/api/admin/users", response_model=list[UserOut])
-def list_all_users(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    _require_admin(current_user)
-    users = db.query(UserDB).order_by(UserDB.created_at.desc()).all()
-    return [UserOut.model_validate(u) for u in users]
-
-
-@app.get("/api/admin/rates")
-def get_rates(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    _require_admin(current_user)
-    credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
-    initial_credits = float(_get_system_config(db, "initial_credits", "0.0"))
-    return {"credits_per_real": credits_per_real, "initial_credits": initial_credits}
-
-
-@app.put("/api/admin/rates")
-def update_rates(
-    payload: dict,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    _require_admin(current_user)
-    credits_per_real = float(payload.get("credits_per_real", 1.0))
-    initial_credits = float(payload.get("initial_credits", 0.0))
-    if credits_per_real <= 0:
-        raise HTTPException(status_code=422, detail="credits_per_real deve ser positivo")
-    if initial_credits < 0:
-        raise HTTPException(status_code=422, detail="initial_credits não pode ser negativo")
-    _set_system_config(db, "credits_per_real", str(credits_per_real))
-    _set_system_config(db, "initial_credits", str(initial_credits))
-    return {"credits_per_real": credits_per_real, "initial_credits": initial_credits}
-
-
-@app.get("/api/payments/rates")
-def get_public_rates(db: Session = Depends(get_db)):
-    credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
-    return {"credits_per_real": credits_per_real}
-
-
-# ---------------------------------------------------------------------------
-# Payment endpoints
-# ---------------------------------------------------------------------------
-@app.post("/api/payments/create")
-def create_payment(
-    payment_data: PaymentCreate,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Cria uma cobrança PIX no Mercado Pago"""
-    if not MERCADOPAGO_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
-    
-    try:
-        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
-
-        credits_per_real = float(_get_system_config(db, "credits_per_real", "1.0"))
-        credits_amount = round(payment_data.amount * credits_per_real, 2)
-
-        payment_request = {
-            "transaction_amount": float(payment_data.amount),
-            "description": f"Compra de {credits_amount} créditos PostGen",
-            "payment_method_id": "pix",
-            "payer": {
-                "email": current_user.email,
-                "first_name": current_user.name.split()[0] if current_user.name else "Cliente",
-            },
-            "notification_url": f"{BASE_URL}/api/payments/webhook",
-        }
-
-        payment_response = sdk.payment().create(payment_request)
-        payment = payment_response["response"]
-
-        if payment_response["status"] not in [200, 201]:
-            mp_error = payment.get("message") or payment.get("error") or str(payment)
-            raise ValueError(f"Mercado Pago error {payment_response['status']}: {mp_error}")
-
-        mp_payment_id = str(payment["id"])
-        qr_code_base64 = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code_base64", "")
-        qr_code_data = payment.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code", "")
-
-        db_payment = PaymentDB(
-            user_id=current_user.id,
-            mp_payment_id=mp_payment_id,
-            amount=payment_data.amount,
-            credits_amount=credits_amount,
-            status="pending",
-            qr_code=qr_code_base64,
-            qr_code_data=qr_code_data,
-        )
-        db.add(db_payment)
-        db.commit()
-        db.refresh(db_payment)
-
-        return {
-            "payment_id": db_payment.id,
-            "mp_payment_id": mp_payment_id,
-            "amount": payment_data.amount,
-            "credits_amount": credits_amount,
-            "status": "pending",
-            "qr_code": qr_code_base64,
-            "qr_code_data": qr_code_data,
-        }
-
-    except Exception as e:
-        print(f"[MP] create_payment exception: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=f"Erro ao criar pagamento: {str(e)}")
-
-
-@app.post("/api/payments/webhook")
-async def payment_webhook(
-    request: dict,
-    db: Session = Depends(get_db),
-):
-    """Webhook para receber notificações do Mercado Pago"""
-    try:
-        # Verificar se é notificação de pagamento
-        if request.get("type") != "payment":
-            return {"status": "ignored"}
-        
-        # Obter ID do pagamento
-        mp_payment_id = str(request.get("data", {}).get("id", ""))
-        if not mp_payment_id:
-            return {"status": "error", "message": "Payment ID not found"}
-        
-        # Buscar pagamento no banco
-        payment = db.query(PaymentDB).filter(PaymentDB.mp_payment_id == mp_payment_id).first()
-        if not payment:
-            return {"status": "error", "message": "Payment not found in database"}
-        
-        # Consultar status atualizado no Mercado Pago
-        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
-        payment_info = sdk.payment().get(mp_payment_id)
-
-        if payment_info["status"] != 200:
-            return {"status": "error", "message": "Failed to get payment info"}
-
-        mp_status = payment_info["response"].get("status", "")
-        old_status = payment.status
-
-        user = db.query(UserDB).filter(UserDB.id == payment.user_id).first()
-        if user:
-            if mp_status == "approved" and old_status != "approved":
-                user.credits_balance += payment.credits_amount
-            elif old_status == "approved" and mp_status in ("cancelled", "refunded", "charged_back"):
-                user.credits_balance = max(0.0, user.credits_balance - payment.credits_amount)
-
-        payment.status = mp_status
-        db.commit()
-
-        return {"status": "success", "payment_status": mp_status}
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-@app.get("/api/payments/my")
-def list_my_payments(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    payments = (
-        db.query(PaymentDB)
-        .filter(PaymentDB.user_id == current_user.id)
-        .order_by(PaymentDB.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": p.id,
-            "amount": p.amount,
-            "credits_amount": p.credits_amount,
-            "status": p.status,
-            "created_at": p.created_at.isoformat() if p.created_at else None,
-        }
-        for p in payments
-    ]
-
-
-@app.get("/api/payments/{payment_id}")
-def get_payment_status(
-    payment_id: int,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Consulta o status de um pagamento"""
-    payment = db.query(PaymentDB).filter(
-        PaymentDB.id == payment_id,
-        PaymentDB.user_id == current_user.id
-    ).first()
-    
-    if not payment:
-        raise HTTPException(status_code=404, detail="Pagamento não encontrado")
-    
-    # Consultar status atualizado no Mercado Pago
-    try:
-        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
-        payment_info = sdk.payment().get(payment.mp_payment_id)
-        
-        if payment_info["status"] == 200:
-            mp_status = payment_info["response"].get("status", payment.status)
-            
-            # Atualizar status se mudou
-            if mp_status != payment.status:
-                old_status = payment.status
-                payment.status = mp_status
-                payment.updated_at = func.now()
-                
-                if mp_status == "approved" and old_status != "approved":
-                    current_user.credits_balance += payment.credits_amount
-                elif old_status == "approved" and mp_status in ("cancelled", "refunded", "charged_back"):
-                    current_user.credits_balance = max(0.0, current_user.credits_balance - payment.credits_amount)
-
-                db.commit()
-                db.refresh(payment)
-    except Exception:
-        pass
-
-    return PaymentOut.model_validate(payment)
-
-
-@app.post("/api/admin/users/{user_id}/reset-credits")
-def admin_reset_credits(
-    user_id: int,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    _require_admin(current_user)
-    user = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
-    user.credits_balance = 0.0
-    db.execute(text("DELETE FROM credit_usage WHERE user_id = :uid"), {"uid": user_id})
-    db.commit()
-    return {"ok": True, "user_id": user_id}
-
-
-# ---------------------------------------------------------------------------
-# Settings endpoints
-# ---------------------------------------------------------------------------
-@app.get("/api/settings", response_model=Settings)
-def get_settings(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    s = get_or_create_settings(current_user, db)
-    result = Settings.model_validate(s)
-    result.azure_openai_api_key = "***" if s.azure_openai_api_key else ""
-    return result
-
-
-@app.put("/api/settings")
-def update_settings(
-    data: Settings,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    s = get_or_create_settings(current_user, db)
-    s.azure_openai_endpoint = data.azure_openai_endpoint
-    s.azure_openai_deployment_name = data.azure_openai_deployment_name
-    s.azure_openai_image_deployment = data.azure_openai_image_deployment
-    s.azure_openai_image_endpoint = data.azure_openai_image_endpoint
-    s.azure_openai_api_version = data.azure_openai_api_version
-    s.public_base_url = data.public_base_url
-    if data.azure_openai_api_key and data.azure_openai_api_key != "***":
-        s.azure_openai_api_key = data.azure_openai_api_key
-    db.commit()
-    return {"message": "Configurações salvas"}
-
-
-@app.get("/api/test-azure")
-def test_azure(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    s = get_or_create_settings(current_user, db)
-    if not s.azure_openai_endpoint or not s.azure_openai_api_key:
-        return {"success": False, "error": "Azure OpenAI não configurado"}
-    try:
-        client = get_azure_client(s)
-        resp = client.chat.completions.create(
-            model=s.azure_openai_deployment_name,
-            messages=[{"role": "user", "content": "Hello"}],
-            max_tokens=5,
-        )
-        return {"success": True, "test_response": resp.choices[0].message.content}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
 # Channels endpoints
 # ---------------------------------------------------------------------------
 @app.get("/api/channels", response_model=List[Channel])
@@ -996,7 +404,7 @@ def create_channel(
                 "\n".join(ch.image_generation_prompt.splitlines()[:5])
                 + "\n\nFrame: Close-up portrait style, profile picture format."
             )
-            image_bytes = _generate_image_bytes(avatar_prompt, ch, s, db, width=768, height=768)
+            image_bytes = generate_image_bytes(avatar_prompt, ch, s, db, width=768, height=768)
             avatar_filename = f"{ch.id}.png"
             avatar_url = upload_bytes_to_blob(image_bytes, f"avatars/{avatar_filename}", "image/png")
             ch.avatar_url = avatar_url
@@ -1291,20 +699,20 @@ def generate_avatar(
         full_prompt = (channel_prompt or data.prompt) + portrait_suffix
 
     if ch:
-        full_prompt += _get_reference_context(ch.id, db)
+        full_prompt += get_reference_context(ch.id, db)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     avatar_filename = f"avatar_{timestamp}.png"
 
     try:
-        image_bytes = _generate_image_bytes(full_prompt, ch, s, db, width=768, height=768)
+        image_bytes = generate_image_bytes(full_prompt, ch, s, db, width=768, height=768)
     except HTTPException:
         raise
     except Exception as e:
         if data.prompt and channel_prompt:
             try:
-                fallback = data.prompt + portrait_suffix + (_get_reference_context(ch.id, db) if ch else "")
-                image_bytes = _generate_image_bytes(fallback, ch, s, db, width=768, height=768)
+                fallback = data.prompt + portrait_suffix + (get_reference_context(ch.id, db) if ch else "")
+                image_bytes = generate_image_bytes(fallback, ch, s, db, width=768, height=768)
             except Exception as e2:
                 raise HTTPException(status_code=500, detail=f"Falha ao gerar avatar: {str(e2)}")
         else:
@@ -1516,9 +924,9 @@ Return only the post text."""
             image_prompt += f"\n\nItem específico: {main_subject}"
         if data.additional_prompt:
             image_prompt += f"\n\n{data.additional_prompt}"
-        image_prompt += _get_reference_context(ch.id, db)
+        image_prompt += get_reference_context(ch.id, db)
         try:
-            img_bytes = _generate_image_bytes(image_prompt, ch, s, db)
+            img_bytes = generate_image_bytes(image_prompt, ch, s, db)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
 
@@ -1605,18 +1013,18 @@ def generate_post_image(
     else:
         full_prompt = channel_prompt or data.prompt
     if ch:
-        full_prompt += _get_reference_context(ch.id, db)
+        full_prompt += get_reference_context(ch.id, db)
 
     try:
-        img_bytes = _generate_image_bytes(full_prompt, ch, s, db)
+        img_bytes = generate_image_bytes(full_prompt, ch, s, db)
     except HTTPException:
         raise
     except Exception as e:
         # Content safety fallback: retry with user prompt only
         if data.prompt and channel_prompt:
             try:
-                fallback_prompt = data.prompt + (f"\n\n{_get_reference_context(ch.id, db)}" if ch else "")
-                img_bytes = _generate_image_bytes(fallback_prompt, ch, s, db)
+                fallback_prompt = data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else "")
+                img_bytes = generate_image_bytes(fallback_prompt, ch, s, db)
             except Exception as e2:
                 raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {str(e2)}")
         else:
@@ -2824,200 +2232,6 @@ def refresh_channel_insights(
             errors += 1
 
     return {"refreshed": refreshed, "errors": errors, "total": len(posts) + len(videos)}
-
-
-# ---------------------------------------------------------------------------
-# Credits endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/api/credits/summary")
-def get_credits_summary(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Retorna um resumo do consumo de créditos do usuário.
-    """
-    # Total geral
-    total_result = db.execute(
-        text("SELECT SUM(credits_consumed) as total FROM credit_usage WHERE user_id = :user_id"),
-        {"user_id": current_user.id}
-    ).fetchone()
-    total_credits = float(total_result[0] or 0.0)
-    
-    # Por tipo de operação
-    by_operation = db.execute(
-        text("""
-            SELECT operation_type, SUM(credits_consumed) as total
-            FROM credit_usage
-            WHERE user_id = :user_id
-            GROUP BY operation_type
-            ORDER BY total DESC
-        """),
-        {"user_id": current_user.id}
-    ).fetchall()
-    
-    # Por canal
-    by_channel = db.execute(
-        text("""
-            SELECT c.name as channel_name, cu.channel_id, SUM(cu.credits_consumed) as total
-            FROM credit_usage cu
-            LEFT JOIN channels c ON cu.channel_id = c.id
-            WHERE cu.user_id = :user_id AND cu.channel_id IS NOT NULL
-            GROUP BY cu.channel_id, c.name
-            ORDER BY total DESC
-        """),
-        {"user_id": current_user.id}
-    ).fetchall()
-    
-    # Por tipo de recurso
-    by_resource = db.execute(
-        text("""
-            SELECT resource_type, SUM(credits_consumed) as total
-            FROM credit_usage
-            WHERE user_id = :user_id
-            GROUP BY resource_type
-            ORDER BY total DESC
-        """),
-        {"user_id": current_user.id}
-    ).fetchall()
-    
-    # Últimos 30 dias
-    last_30_days = db.execute(
-        text("""
-            SELECT DATE(created_at) as date, SUM(credits_consumed) as total
-            FROM credit_usage
-            WHERE user_id = :user_id AND created_at >= NOW() - INTERVAL '30 days'
-            GROUP BY DATE(created_at)
-            ORDER BY date DESC
-        """),
-        {"user_id": current_user.id}
-    ).fetchall()
-    
-    return {
-        "total_credits": total_credits,
-        "credits_balance": current_user.credits_balance,
-        "by_operation": [{"operation_type": row[0], "credits": float(row[1] or 0.0)} for row in by_operation],
-        "by_channel": [{"channel_id": row[1], "channel_name": row[0], "credits": float(row[2] or 0.0)} for row in by_channel],
-        "by_resource": [{"resource_type": row[0], "credits": float(row[1] or 0.0)} for row in by_resource],
-        "last_30_days": [{"date": str(row[0]), "credits": float(row[1] or 0.0)} for row in last_30_days],
-    }
-
-
-@app.get("/api/credits/log", response_model=List[CreditUsageOut])
-def get_credits_log(
-    channel_id: Optional[str] = None,
-    resource_type: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=1000),
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Retorna o log detalhado de consumo de créditos.
-    """
-    query = db.query(CreditUsageDB).filter(CreditUsageDB.user_id == current_user.id)
-    
-    if channel_id:
-        query = query.filter(CreditUsageDB.channel_id == channel_id)
-    
-    if resource_type:
-        query = query.filter(CreditUsageDB.resource_type == resource_type)
-    
-    usage_records = query.order_by(CreditUsageDB.created_at.desc()).limit(limit).all()
-    
-    # Get channel names
-    channel_ids = list(set([r.channel_id for r in usage_records if r.channel_id]))
-    channel_names = {}
-    if channel_ids:
-        channels = db.query(ChannelDB.id, ChannelDB.name).filter(ChannelDB.id.in_(channel_ids)).all()
-        channel_names = {ch.id: ch.name for ch in channels}
-    
-    result = []
-    for record in usage_records:
-        result.append(CreditUsageOut(
-            id=record.id,
-            user_id=record.user_id,
-            channel_id=record.channel_id,
-            channel_name=channel_names.get(record.channel_id),
-            resource_type=record.resource_type,
-            resource_id=record.resource_id,
-            operation_type=record.operation_type,
-            model_name=record.model_name,
-            input_tokens=record.input_tokens,
-            output_tokens=record.output_tokens,
-            total_tokens=record.total_tokens,
-            credits_consumed=record.credits_consumed,
-            metadata=json.loads(record.meta_info or "{}"),
-            created_at=record.created_at.isoformat(),
-        ))
-    
-    return result
-
-
-@app.get("/api/credits/channel/{channel_id}")
-def get_channel_credits(
-    channel_id: str,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Retorna estatísticas de créditos para um canal específico.
-    """
-    ch = get_channel_or_404(channel_id, current_user, db)
-    
-    # Total do canal
-    total_result = db.execute(
-        text("SELECT SUM(credits_consumed) as total FROM credit_usage WHERE channel_id = :channel_id"),
-        {"channel_id": channel_id}
-    ).fetchone()
-    total_credits = float(total_result[0] or 0.0)
-    
-    # Por tipo de operação
-    by_operation = db.execute(
-        text("""
-            SELECT operation_type, SUM(credits_consumed) as total, COUNT(*) as count
-            FROM credit_usage
-            WHERE channel_id = :channel_id
-            GROUP BY operation_type
-            ORDER BY total DESC
-        """),
-        {"channel_id": channel_id}
-    ).fetchall()
-    
-    # Últimos recursos criados com créditos
-    recent_resources = db.execute(
-        text("""
-            SELECT resource_type, resource_id, SUM(credits_consumed) as total, MAX(created_at) as created_at
-            FROM credit_usage
-            WHERE channel_id = :channel_id AND resource_id IS NOT NULL
-            GROUP BY resource_type, resource_id
-            ORDER BY created_at DESC
-            LIMIT 20
-        """),
-        {"channel_id": channel_id}
-    ).fetchall()
-    
-    return {
-        "channel_id": channel_id,
-        "channel_name": ch.name,
-        "total_credits": total_credits,
-        "by_operation": [
-            {
-                "operation_type": row[0],
-                "credits": float(row[1] or 0.0),
-                "count": int(row[2])
-            } for row in by_operation
-        ],
-        "recent_resources": [
-            {
-                "resource_type": row[0],
-                "resource_id": row[1],
-                "credits": float(row[2] or 0.0),
-                "created_at": row[3].isoformat() if row[3] else None
-            } for row in recent_resources
-        ],
-    }
-
 
 # ---------------------------------------------------------------------------
 # Instagram Webhooks - Respostas Automáticas
