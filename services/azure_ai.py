@@ -66,20 +66,24 @@ def generate_image_bytes(
         resp = requests.post(
             s.azure_openai_image_endpoint,
             headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={
-                "prompt": prompt,
-                "n": 1,
-                "size": size_str,
-                "response_format": "b64_json",
-                "model": s.azure_openai_image_deployment,
-            },
+            json={"prompt": prompt, "n": 1, "size": size_str},
             timeout=60,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            print(f"[IMAGE] MAI error {resp.status_code}: {resp.text[:500]}")
+            resp.raise_for_status()
         result = resp.json()
-        if not result.get("data") or "b64_json" not in result["data"][0]:
+        print(f"[IMAGE] MAI response keys: {list(result.keys())}")
+        if not result.get("data"):
             raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-        return base64.b64decode(result["data"][0]["b64_json"])
+        item = result["data"][0]
+        if "b64_json" in item:
+            return base64.b64decode(item["b64_json"])
+        if "url" in item:
+            img_resp = requests.get(item["url"], timeout=30)
+            img_resp.raise_for_status()
+            return img_resp.content
+        raise HTTPException(status_code=500, detail=f"Formato de resposta inesperado: {list(item.keys())}")
 
 
 def get_reference_context(channel_id: str, db: Session) -> str:
