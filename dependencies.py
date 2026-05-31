@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRE_DAYS, ADMIN_EMAIL
 from database import get_db
-from models import UserDB, ChannelDB, SettingsDB
+from models import UserDB, ChannelDB, PostDB, VideoDB, SettingsDB
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer()
@@ -93,3 +93,29 @@ def get_channel_or_404(channel_id: str, user: UserDB, db: Session) -> ChannelDB:
     if not ch:
         raise HTTPException(status_code=404, detail="Canal não encontrado")
     return ch
+
+
+def get_post_or_404(post_id: str, user: UserDB, db: Session) -> PostDB:
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == user.id).all()
+    ]
+    p = db.query(PostDB).filter(
+        PostDB.id == post_id,
+        PostDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Post não encontrado")
+    return p
+
+
+def get_video_or_404(video_id: str, user: UserDB, db: Session) -> VideoDB:
+    user_channel_ids = [
+        ch.id for ch in db.query(ChannelDB.id).filter(ChannelDB.user_id == user.id).all()
+    ]
+    v = db.query(VideoDB).filter(
+        VideoDB.id == video_id,
+        VideoDB.channel_id.in_(user_channel_ids),
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    return v
