@@ -142,12 +142,16 @@ Return only the post text."""
         image_error = "Endpoint de geração de imagem não configurado. Configure em Configurações → Azure OpenAI Image Endpoint."
         print(f"[IMAGE] Skipping image generation: {image_error}")
     else:
-        image_prompt = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}. Main subject: {main_subject}"
-        if ch.image_generation_prompt:
-            image_prompt += f"\n\nItem específico: {main_subject}"
+        # Combina prompts do canal: visual (image_prompt) + contexto de personagens (text_prompt) + assunto do post
+        base_image = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}."
+        base_text = ch.text_generation_prompt or ""
+        parts = [p for p in [base_image, base_text] if p.strip()]
+        image_prompt = "\n\n".join(parts)
+        image_prompt += f"\n\nTema específico desta imagem: {main_subject}"
         if data.additional_prompt:
             image_prompt += f"\n\n{data.additional_prompt}"
         image_prompt += get_reference_context(ch.id, db)
+        print(f"[IMAGE] Prompt ({len(image_prompt)} chars): {image_prompt[:300]}")
         try:
             img_bytes = generate_image_bytes(image_prompt, ch, s, db)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
