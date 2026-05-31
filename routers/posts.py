@@ -152,8 +152,30 @@ Return only the post text."""
             image_prompt += f"\n\n{data.additional_prompt}"
         image_prompt += get_reference_context(ch.id, db)
         print(f"[IMAGE] Prompt ({len(image_prompt)} chars): {image_prompt[:300]}")
-        try:
-            img_bytes = generate_image_bytes(image_prompt, ch, s, db)
+
+        def _try_generate(prompt: str) -> bytes:
+            return generate_image_bytes(prompt, ch, s, db)
+
+        # Tenta com prompt completo; se bloqueado por content safety, tenta versão simplificada
+        prompts_to_try = [
+            image_prompt,
+            f"Artistic illustration: {main_subject}. Style: natural, candid photography.",
+        ]
+        img_bytes = None
+        for attempt_prompt in prompts_to_try:
+            try:
+                img_bytes = _try_generate(attempt_prompt)
+                image_prompt = attempt_prompt
+                break
+            except Exception as e:
+                err_str = str(e)
+                print(f"[IMAGE] Attempt failed: {err_str[:200]}")
+                if "content_safety" not in err_str.lower() and "responsibleai" not in err_str.lower():
+                    image_error = err_str
+                    break
+                image_error = "Prompt bloqueado pelo filtro de segurança do modelo. Considere revisar o prompt de imagem do canal."
+
+        if img_bytes:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
             image_model = ch.image_model or "mai"
@@ -163,9 +185,7 @@ Return only the post text."""
                 operation_type="image_generation", model_name=image_model,
                 images_count=1, metadata={"prompt_length": len(image_prompt)},
             )
-        except Exception as e:
-            image_error = str(e)
-            print(f"Image generation failed: {e}")
+            image_error = None
 
     p = PostDB(
         id=post_id, channel_id=ch.id, channel_name=ch.name,
@@ -222,20 +242,30 @@ def generate_post_image(
     if ch:
         full_prompt += get_reference_context(ch.id, db)
 
-    try:
-        img_bytes = generate_image_bytes(full_prompt, ch, s, db)
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Fallback: tenta só com o prompt do usuário + referências visuais
-        if data.prompt:
-            try:
-                fallback_prompt = data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else "")
-                img_bytes = generate_image_bytes(fallback_prompt, ch, s, db)
-            except Exception as e2:
-                raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {str(e2)}")
-        else:
-            raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {str(e)}")
+    img_bytes = None
+    prompts_to_try = [full_prompt]
+    # Fallbacks progressivos caso o prompt completo seja bloqueado por content safety
+    if data.prompt:
+        prompts_to_try.append(data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else ""))
+    prompts_to_try.append(f"Artistic photo illustration: {data.prompt or 'scene'}")
+
+    last_error = None
+    for attempt_prompt in prompts_to_try:
+        try:
+            img_bytes = generate_image_bytes(attempt_prompt, ch, s, db)
+            full_prompt = attempt_prompt
+            last_error = None
+            break
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_error = str(e)
+            print(f"[IMAGE EDIT] Attempt failed: {last_error[:150]}")
+            if "content_safety" not in last_error.lower() and "responsibleai" not in last_error.lower():
+                break
+
+    if not img_bytes:
+        raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {last_error}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
