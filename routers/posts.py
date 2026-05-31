@@ -228,19 +228,52 @@ def generate_post_image(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    p = get_post_or_404(post_id, current_user, db)
-    s = get_or_create_settings(current_user, db)
+    print(f"\n{'='*80}")
+    print(f"[IMAGE REGEN] Iniciando regeneração de imagem para post_id={post_id}")
+    print(f"[IMAGE REGEN] User: {current_user.email}, Channel ID: {data.channel_id}")
+    print(f"[IMAGE REGEN] Prompt do usuário: {data.prompt[:100] if data.prompt else '(vazio)'}...")
+    
+    try:
+        p = get_post_or_404(post_id, current_user, db)
+        print(f"[IMAGE REGEN] ✓ Post encontrado")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao buscar post: {str(e)}")
+        raise
+    
+    try:
+        s = get_or_create_settings(current_user, db)
+        print(f"[IMAGE REGEN] ✓ Settings carregadas")
+        print(f"[IMAGE REGEN] Image Endpoint: {s.azure_openai_image_endpoint[:50] if s.azure_openai_image_endpoint else 'NÃO CONFIGURADO'}...")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao carregar settings: {str(e)}")
+        raise
+    
     if not s.azure_openai_image_endpoint:
+        print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado")
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
-    ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+    try:
+        ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+        print(f"[IMAGE REGEN] ✓ Canal encontrado: {ch.name if ch else 'None'}")
+        if ch:
+            print(f"[IMAGE REGEN] Modelo de imagem do canal: {ch.image_model or 'mai (padrão)'}")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao buscar canal: {str(e)}")
+        raise
+    
     # Combina: prompt de imagem do canal + contexto de texto (quem são os personagens) + prompt do usuário
-    image_prompt = (ch.image_generation_prompt or "") if ch else ""
-    text_context = (ch.text_generation_prompt or "") if ch else ""
-    parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
-    full_prompt = "\n\n".join(parts)
-    if ch:
-        full_prompt += get_reference_context(ch.id, db)
+    try:
+        image_prompt = (ch.image_generation_prompt or "") if ch else ""
+        text_context = (ch.text_generation_prompt or "") if ch else ""
+        parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
+        full_prompt = "\n\n".join(parts)
+        if ch:
+            full_prompt += get_reference_context(ch.id, db)
+        print(f"[IMAGE REGEN] ✓ Prompt construído ({len(full_prompt)} caracteres)")
+        print(f"[IMAGE REGEN] Prompt preview: {full_prompt[:200]}...")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao construir prompt: {str(e)}")
+        raise
 
     img_bytes = None
     prompts_to_try = [full_prompt]
@@ -248,38 +281,64 @@ def generate_post_image(
     if data.prompt:
         prompts_to_try.append(data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else ""))
     prompts_to_try.append(f"Artistic photo illustration: {data.prompt or 'scene'}")
+    
+    print(f"[IMAGE REGEN] Tentará {len(prompts_to_try)} variações de prompt")
 
     last_error = None
-    for attempt_prompt in prompts_to_try:
+    for i, attempt_prompt in enumerate(prompts_to_try, 1):
+        print(f"[IMAGE REGEN] Tentativa {i}/{len(prompts_to_try)}: prompt de {len(attempt_prompt)} chars")
         try:
+            print(f"[IMAGE REGEN]   Chamando generate_image_bytes...")
             img_bytes = generate_image_bytes(attempt_prompt, ch, s, db)
             full_prompt = attempt_prompt
             last_error = None
+            print(f"[IMAGE REGEN] ✓ Imagem gerada com sucesso! ({len(img_bytes)} bytes)")
             break
-        except HTTPException:
+        except HTTPException as he:
+            print(f"[IMAGE REGEN] ✗ HTTPException capturada: status={he.status_code}, detail={he.detail}")
             raise
         except Exception as e:
             last_error = str(e)
-            print(f"[IMAGE EDIT] Attempt failed: {last_error[:150]}")
+            print(f"[IMAGE REGEN] ✗ Tentativa {i} falhou: {last_error[:300]}")
             if "content_safety" not in last_error.lower() and "responsibleai" not in last_error.lower():
+                print(f"[IMAGE REGEN]   Erro não é de content safety - abortando tentativas")
                 break
+            print(f"[IMAGE REGEN]   Erro de content safety - tentando fallback...")
 
     if not img_bytes:
-        raise HTTPException(status_code=500, detail=f"Falha ao gerar imagem: {last_error}")
+        error_msg = f"Falha ao gerar imagem após {len(prompts_to_try)} tentativas: {last_error}"
+        print(f"[IMAGE REGEN] ✗ FALHA FINAL: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
-    p.image_path = blob_url
-    p.prompt = full_prompt
-    image_model = ch.image_model if ch else "mai"
-    credits = register_credit_usage(
-        db=db, user_id=current_user.id, channel_id=ch.id if ch else None,
-        resource_type="post", resource_id=post_id,
-        operation_type="image_generation", model_name=image_model,
-        images_count=1, metadata={"prompt_length": len(full_prompt), "regenerated": True},
-    )
-    p.credits_consumed = (p.credits_consumed or 0.0) + credits
-    db.commit()
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        blob_name = f"posts/{post_id}_{ts}.png"
+        print(f"[IMAGE REGEN] Fazendo upload para blob: {blob_name}")
+        blob_url = upload_bytes_to_blob(img_bytes, blob_name, "image/png")
+        print(f"[IMAGE REGEN] ✓ Upload concluído: {blob_url[:80]}...")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO no upload do blob: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao fazer upload da imagem: {str(e)}")
+    
+    try:
+        p.image_path = blob_url
+        p.prompt = full_prompt
+        image_model = ch.image_model if ch else "mai"
+        credits = register_credit_usage(
+            db=db, user_id=current_user.id, channel_id=ch.id if ch else None,
+            resource_type="post", resource_id=post_id,
+            operation_type="image_generation", model_name=image_model,
+            images_count=1, metadata={"prompt_length": len(full_prompt), "regenerated": True},
+        )
+        p.credits_consumed = (p.credits_consumed or 0.0) + credits
+        db.commit()
+        print(f"[IMAGE REGEN] ✓ Post atualizado no banco, créditos: {credits}")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao atualizar banco: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar no banco de dados: {str(e)}")
+    
+    print(f"[IMAGE REGEN] ✓✓✓ SUCESSO TOTAL! Retornando URL")
+    print(f"{'='*80}\n")
     return {"success": True, "image_url": blob_url, "image_path": blob_url}
 
 

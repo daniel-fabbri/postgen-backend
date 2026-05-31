@@ -22,22 +22,41 @@ def generate_image_bytes(
 ) -> bytes:
     """Roteia geração de imagem para o modelo correto do canal (MAI ou GPT-Image-2)."""
     model = (ch.image_model or "mai") if ch else "mai"
+    print(f"[GEN_IMAGE] Iniciando geração com modelo: {model}")
+    print(f"[GEN_IMAGE] Dimensões: {width}x{height}")
+    print(f"[GEN_IMAGE] Prompt length: {len(prompt)} chars")
 
     if model == "gpt-image-2":
+        print(f"[GEN_IMAGE] Usando GPT-Image-2")
         if not GPT_IMAGE_2_API_KEY:
+            print(f"[GEN_IMAGE] ✗ GPT_IMAGE_2_API_KEY não configurado")
             raise HTTPException(status_code=400, detail="GPT_IMAGE_2_API_KEY não configurado no servidor")
-        from openai import AzureOpenAI as _AzOAI
-        img_client = _AzOAI(
-            azure_endpoint=GPT_IMAGE_2_ENDPOINT,
-            api_key=GPT_IMAGE_2_API_KEY,
-            api_version="2025-04-01-preview",
-        )
-        refs = db.query(ReferenceImageDB).filter(
-            ReferenceImageDB.channel_id == ch.id,
-        ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+        
+        try:
+            from openai import AzureOpenAI as _AzOAI
+            print(f"[GEN_IMAGE] Criando cliente Azure OpenAI para GPT-Image-2")
+            img_client = _AzOAI(
+                azure_endpoint=GPT_IMAGE_2_ENDPOINT,
+                api_key=GPT_IMAGE_2_API_KEY,
+                api_version="2025-04-01-preview",
+            )
+            print(f"[GEN_IMAGE] ✓ Cliente criado")
+        except Exception as e:
+            print(f"[GEN_IMAGE] ✗ Erro ao criar cliente: {str(e)}")
+            raise
+        
+        try:
+            refs = db.query(ReferenceImageDB).filter(
+                ReferenceImageDB.channel_id == ch.id,
+            ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+            print(f"[GEN_IMAGE] Imagens de referência encontradas: {len(refs)}")
+        except Exception as e:
+            print(f"[GEN_IMAGE] ✗ Erro ao buscar referências: {str(e)}")
+            raise
 
         if refs:
             try:
+                print(f"[GEN_IMAGE] Tentando gerar com edit usando referência...")
                 ref_bytes = requests.get(refs[0].blob_url, timeout=20).content
                 size_str = f"{width}x{height}" if width == height else "1024x1024"
                 result = img_client.images.edit(
@@ -47,43 +66,91 @@ def generate_image_bytes(
                     n=1,
                     size=size_str,
                 )
-                return base64.b64decode(result.data[0].b64_json)
+                img_bytes = base64.b64decode(result.data[0].b64_json)
+                print(f"[GEN_IMAGE] ✓ Imagem gerada com edit: {len(img_bytes)} bytes")
+                return img_bytes
             except Exception as e:
-                print(f"gpt-image-2 edit failed, falling back to generate: {e}")
+                print(f"[GEN_IMAGE] gpt-image-2 edit falhou, usando generate: {str(e)[:200]}")
 
-        result = img_client.images.generate(
-            model="gpt-image-2",
-            prompt=prompt,
-            n=1,
-            size="1024x1024",
-        )
-        return base64.b64decode(result.data[0].b64_json)
+        try:
+            print(f"[GEN_IMAGE] Gerando com images.generate...")
+            result = img_client.images.generate(
+                model="gpt-image-2",
+                prompt=prompt,
+                n=1,
+                size="1024x1024",
+            )
+            img_bytes = base64.b64decode(result.data[0].b64_json)
+            print(f"[GEN_IMAGE] ✓ Imagem gerada: {len(img_bytes)} bytes")
+            return img_bytes
+        except Exception as e:
+            print(f"[GEN_IMAGE] ✗ Erro no generate: {str(e)}")
+            raise
 
     else:  # MAI / DALL-E compatible endpoint
+        print(f"[GEN_IMAGE] Usando MAI/DALL-E endpoint")
         if not s.azure_openai_image_endpoint:
+            print(f"[GEN_IMAGE] ✗ Endpoint não configurado")
             raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
+        
         size_str = f"{width}x{height}"
-        resp = requests.post(
-            s.azure_openai_image_endpoint,
-            headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "n": 1, "size": size_str, "model": s.azure_openai_image_deployment},
-            timeout=60,
-        )
-        if not resp.ok:
-            print(f"[IMAGE] MAI error {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
-        result = resp.json()
-        print(f"[IMAGE] MAI response keys: {list(result.keys())}")
-        if not result.get("data"):
-            raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-        item = result["data"][0]
-        if "b64_json" in item:
-            return base64.b64decode(item["b64_json"])
-        if "url" in item:
-            img_resp = requests.get(item["url"], timeout=30)
-            img_resp.raise_for_status()
-            return img_resp.content
-        raise HTTPException(status_code=500, detail=f"Formato de resposta inesperado: {list(item.keys())}")
+        endpoint = s.azure_openai_image_endpoint
+        deployment = s.azure_openai_image_deployment
+        print(f"[GEN_IMAGE] Endpoint: {endpoint[:60]}...")
+        print(f"[GEN_IMAGE] Deployment: {deployment}")
+        print(f"[GEN_IMAGE] Size: {size_str}")
+        
+        payload = {"prompt": prompt, "n": 1, "size": size_str, "model": deployment}
+        print(f"[GEN_IMAGE] Payload keys: {list(payload.keys())}")
+        
+        try:
+            print(f"[GEN_IMAGE] Fazendo requisição POST...")
+            resp = requests.post(
+                endpoint,
+                headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
+                json=payload,
+                timeout=60,
+            )
+            print(f"[GEN_IMAGE] Response status: {resp.status_code}")
+            
+            if not resp.ok:
+                error_text = resp.text[:500]
+                print(f"[GEN_IMAGE] ✗ MAI error {resp.status_code}: {error_text}")
+                resp.raise_for_status()
+            
+            result = resp.json()
+            print(f"[GEN_IMAGE] ✓ Response recebida, keys: {list(result.keys())}")
+            
+            if not result.get("data"):
+                print(f"[GEN_IMAGE] ✗ Sem campo 'data' na resposta")
+                raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
+            
+            item = result["data"][0]
+            print(f"[GEN_IMAGE] Item keys: {list(item.keys())}")
+            
+            if "b64_json" in item:
+                print(f"[GEN_IMAGE] Decodificando b64_json...")
+                img_bytes = base64.b64decode(item["b64_json"])
+                print(f"[GEN_IMAGE] ✓ Imagem decodificada: {len(img_bytes)} bytes")
+                return img_bytes
+            
+            if "url" in item:
+                img_url = item["url"]
+                print(f"[GEN_IMAGE] Baixando de URL: {img_url[:80]}...")
+                img_resp = requests.get(img_url, timeout=30)
+                img_resp.raise_for_status()
+                img_bytes = img_resp.content
+                print(f"[GEN_IMAGE] ✓ Imagem baixada: {len(img_bytes)} bytes")
+                return img_bytes
+            
+            print(f"[GEN_IMAGE] ✗ Formato de resposta inesperado: {list(item.keys())}")
+            raise HTTPException(status_code=500, detail=f"Formato de resposta inesperado: {list(item.keys())}")
+        except requests.exceptions.RequestException as e:
+            print(f"[GEN_IMAGE] ✗ Erro de requisição: {str(e)[:300]}")
+            raise
+        except Exception as e:
+            print(f"[GEN_IMAGE] ✗ Erro inesperado: {str(e)[:300]}")
+            raise
 
 
 def get_reference_context(channel_id: str, db: Session) -> str:
