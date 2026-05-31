@@ -1,9 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, PlainTextResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from urllib.parse import urlencode
-from pydantic import BaseModel
 from typing import Optional, List
 import os
 import base64
@@ -14,242 +12,40 @@ import tempfile
 import requests
 from datetime import datetime, timedelta, timezone
 from openai import AzureOpenAI
-from dotenv import load_dotenv
-from sqlalchemy import (
-    create_engine, Column, String, Text, Boolean, Integer, Float,
-    DateTime, ForeignKey, text
-)
-from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from sqlalchemy.sql import func
-from passlib.context import CryptContext
-from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+from sqlalchemy import text
 from azure.storage.blob import BlobServiceClient, ContentSettings
 import mercadopago
 
-load_dotenv()
-
-app = FastAPI(title="PostGen API")
-# Config
-# ---------------------------------------------------------------------------
-BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8004").rstrip("/")
-_code_dir = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.getenv("STORAGE_BASE", _code_dir)
-_raw_origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+from config import (
+    BASE_URL, BASE_DIR, ALLOWED_ORIGINS,
+    AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER,
+    AZURE_SORA_ENDPOINT, AZURE_SORA_API_KEY,
+    GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY,
+    INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET, FRONTEND_URL,
+    MERCADOPAGO_ACCESS_TOKEN, INSTAGRAM_WEBHOOK_VERIFY_TOKEN,
 )
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-JWT_SECRET = os.getenv("JWT_SECRET", "changeme-insecure-default-secret-32chars!!")
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_DAYS = 30
-
-AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "images")
-
-AZURE_SORA_ENDPOINT = os.getenv("AZURE_SORA_ENDPOINT", "").rstrip("/")
-AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
-
-GPT_IMAGE_2_ENDPOINT = os.getenv("GPT_IMAGE_2_ENDPOINT", "https://postgen-ai.openai.azure.com").rstrip("/")
-GPT_IMAGE_2_API_KEY = os.getenv("GPT_IMAGE_2_API_KEY", "")
-
-INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
-INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-
-MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+from database import engine, SessionLocal, Base, get_db
+from models import (
+    UserDB, ChannelDB, PostDB, VideoDB, VideoProjectDB, MediaInsightsDB,
+    ReferenceImageDB, AvatarDB, SettingsDB, CreditUsageDB, SystemConfigDB, PaymentDB,
+)
+from schemas import (
+    UserRegister, UserLogin, UserOut, UserUpdate, TokenOut, Settings, Channel,
+    GeneratePostRequest, Post, InsightsOut, DashboardItemOut, ChannelDashboardOut,
+    SavedPost, GenerateAvatarRequest, UpdateAvatarRequest, TestInstagramRequest,
+    GenerateVideoRequest, SavedVideo, UpdateVideoCaptionRequest, VideoProjectOut,
+    CreateVideoProjectRequest, UpdateVideoProjectClipsRequest, GenerateProjectClipRequest,
+    AddVideoToProjectRequest, ReferenceImageOut, AvatarInfo, UpdatePostRequest,
+    GeneratePostImageRequest, CreditUsageOut, PaymentCreate, PaymentOut,
+)
+from dependencies import (
+    hash_password, verify_password, create_access_token,
+    get_current_user, _require_admin, get_or_create_settings, get_azure_client,
+    get_channel_or_404,
+)
 
 
-class UserDB(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
-    password_hash = Column(String(255), nullable=False)
-    name = Column(String(255), nullable=False)
-    credits_balance = Column(Float, default=0.0)  # Saldo de créditos disponíveis
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    channels = relationship("ChannelDB", back_populates="user", cascade="all, delete-orphan")
-    settings = relationship("SettingsDB", back_populates="user", uselist=False, cascade="all, delete-orphan")
-    payments = relationship("PaymentDB", back_populates="user", cascade="all, delete-orphan")
-
-
-class ChannelDB(Base):
-    __tablename__ = "channels"
-    id = Column(String(50), primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    name = Column(String(255), nullable=False)
-    objective = Column(Text, default="")
-    text_generation_prompt = Column(Text, nullable=True)
-    image_generation_prompt = Column(Text, nullable=True)
-    avatar_url = Column(Text, nullable=True)
-    suggested_image_url = Column(Text, nullable=True)
-    instagram_user_id = Column(String(255), nullable=True)
-    instagram_access_token = Column(Text, nullable=True)
-    image_model = Column(String(20), default="mai")   # "mai" | "gpt-image-2"
-    auto_reply_enabled = Column(Boolean, default=False)  # Respostas automáticas via webhook
-    auto_reply_prompt = Column(Text, nullable=True)  # Prompt personalizado para respostas automáticas
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    user = relationship("UserDB", back_populates="channels")
-    posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
-    videos = relationship("VideoDB", back_populates="channel", cascade="all, delete-orphan")
-    avatars = relationship("AvatarDB", back_populates="channel")
-    reference_images = relationship("ReferenceImageDB", back_populates="channel", cascade="all, delete-orphan")
-
-
-class PostDB(Base):
-    __tablename__ = "posts"
-    id = Column(String(100), primary_key=True)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
-    channel_name = Column(String(255), nullable=False)
-    text = Column(Text, default="")
-    image_path = Column(Text, default="")
-    prompt = Column(Text, nullable=True)
-    ig_media_id = Column(String(100), nullable=True)
-    published = Column(Boolean, default=False)
-    credits_consumed = Column(Float, default=0.0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    channel = relationship("ChannelDB", back_populates="posts")
-
-
-class VideoDB(Base):
-    __tablename__ = "videos"
-    id = Column(String(100), primary_key=True)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
-    channel_name = Column(String(255), nullable=False)
-    prompt = Column(Text, default="")
-    caption = Column(Text, default="")
-    video_path = Column(Text, default="")
-    duration_seconds = Column(Integer, default=4)
-    size = Column(String(20), default="720x1280")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    published = Column(Boolean, default=False)
-    is_project_clip = Column(Boolean, default=False)
-    ig_media_id = Column(String(100), nullable=True)
-    credits_consumed = Column(Float, default=0.0)
-    channel = relationship("ChannelDB", back_populates="videos")
-
-
-class VideoProjectDB(Base):
-    __tablename__ = "video_projects"
-    id = Column(String(100), primary_key=True)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    title = Column(String(255), default="")
-    clip_ids = Column(Text, default="[]")
-    clip_urls = Column(Text, default="{}")  # {video_id: original_url} — never overwritten by exports
-    root_video_id = Column(String(100), nullable=True)
-    exported_video_id = Column(String(100), nullable=True)  # the compiled result in the feed
-    exported_path = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-class MediaInsightsDB(Base):
-    __tablename__ = "media_insights"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    media_type = Column(String(10), nullable=False)   # "post" | "video"
-    media_id = Column(String(100), nullable=False, index=True)
-    ig_media_id = Column(String(100), nullable=False)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
-    like_count = Column(Integer, default=0)
-    comments_count = Column(Integer, default=0)
-    impressions = Column(Integer, nullable=True)
-    reach = Column(Integer, nullable=True)
-    saved = Column(Integer, nullable=True)
-    shares = Column(Integer, nullable=True)
-    video_views = Column(Integer, nullable=True)
-    total_interactions = Column(Integer, default=0)
-    engagement_rate = Column(Float, nullable=True)   # (interactions / reach) * 100
-    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class ReferenceImageDB(Base):
-    __tablename__ = "reference_images"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    blob_url = Column(Text, nullable=False)
-    description = Column(Text, nullable=True)   # Auto-extracted via vision model
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    channel = relationship("ChannelDB", back_populates="reference_images")
-
-
-class AvatarDB(Base):
-    __tablename__ = "avatars"
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String(255), unique=True, index=True, nullable=False)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="SET NULL"), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    channel = relationship("ChannelDB", back_populates="avatars")
-
-
-class SettingsDB(Base):
-    __tablename__ = "settings"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
-    azure_openai_endpoint = Column(Text, default="")
-    azure_openai_api_key = Column(Text, default="")
-    azure_openai_deployment_name = Column(Text, default="gpt-4")
-    azure_openai_image_deployment = Column(Text, default="dall-e-3")
-    azure_openai_image_endpoint = Column(Text, default="")
-    azure_openai_api_version = Column(Text, default="2024-02-01")
-    public_base_url = Column(Text, default="http://localhost:8004")
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    user = relationship("UserDB", back_populates="settings")
-
-
-class CreditUsageDB(Base):
-    __tablename__ = "credit_usage"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    channel_id = Column(String(50), ForeignKey("channels.id", ondelete="CASCADE"), nullable=True)
-    resource_type = Column(String(20), nullable=False)  # "post" | "video" | "avatar" | "image"
-    resource_id = Column(String(100), nullable=True)  # ID do post/vídeo/avatar gerado
-    operation_type = Column(String(30), nullable=False)  # "text_generation" | "image_generation" | "video_generation" | "tts"
-    model_name = Column(String(100), nullable=False)  # Nome do modelo usado
-    input_tokens = Column(Integer, default=0)
-    output_tokens = Column(Integer, default=0)
-    total_tokens = Column(Integer, default=0)
-    credits_consumed = Column(Float, default=0.0)  # Créditos consumidos (calculado)
-    meta_info = Column(Text, default="{}")  # JSON com informações adicionais
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class SystemConfigDB(Base):
-    __tablename__ = "system_config"
-    id = Column(Integer, primary_key=True)
-    key = Column(String(100), unique=True, nullable=False, index=True)
-    value = Column(Text, nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-class PaymentDB(Base):
-    __tablename__ = "payments"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    mp_payment_id = Column(String(100), unique=True, nullable=False)  # ID do Mercado Pago
-    amount = Column(Float, nullable=False)  # Valor em R$
-    credits_amount = Column(Float, nullable=False)  # Quantidade de créditos (1 R$ = 1 crédito)
-    status = Column(String(20), default="pending")  # pending | approved | rejected | cancelled
-    qr_code = Column(Text, nullable=True)  # QRCode base64
-    qr_code_data = Column(Text, nullable=True)  # Código PIX copia-cola
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    user = relationship("UserDB", back_populates="payments")
-
-
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
 app = FastAPI(title="PostGen API")
 
 app.add_middleware(
@@ -373,293 +169,6 @@ def on_startup():
 
 
 # ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-class UserRegister(BaseModel):
-    email: str
-    password: str
-    name: str
-
-
-class UserLogin(BaseModel):
-    email: str
-    password: str
-
-
-class UserOut(BaseModel):
-    id: int
-    email: str
-    name: str
-    credits_balance: float
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class UserUpdate(BaseModel):
-    name: str
-    email: str
-
-
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: UserOut
-
-
-class Settings(BaseModel):
-    azure_openai_endpoint: str = ""
-    azure_openai_api_key: str = ""
-    azure_openai_deployment_name: str = "gpt-4"
-    azure_openai_image_deployment: str = "dall-e-3"
-    azure_openai_image_endpoint: str = ""
-    azure_openai_api_version: str = "2024-02-01"
-    public_base_url: str = "http://localhost:8004"
-
-    class Config:
-        from_attributes = True
-
-
-class Channel(BaseModel):
-    id: Optional[str] = None
-    name: str
-    objective: str
-    text_generation_prompt: Optional[str] = None
-    image_generation_prompt: Optional[str] = None
-    avatar_url: Optional[str] = None
-    suggested_image_url: Optional[str] = None
-    created_at: Optional[str] = None
-    instagram_user_id: Optional[str] = None
-    instagram_access_token: Optional[str] = None
-    image_model: Optional[str] = "mai"
-    auto_reply_enabled: Optional[bool] = False
-    auto_reply_prompt: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class GeneratePostRequest(BaseModel):
-    channel_id: str
-    additional_prompt: Optional[str] = None
-
-
-class Post(BaseModel):
-    id: str = ""
-    text: str
-    image_url: str
-    image_error: Optional[str] = None
-
-
-class InsightsOut(BaseModel):
-    like_count: int = 0
-    comments_count: int = 0
-    impressions: Optional[int] = None
-    reach: Optional[int] = None
-    saved: Optional[int] = None
-    shares: Optional[int] = None
-    video_views: Optional[int] = None
-    total_interactions: int = 0
-    engagement_rate: Optional[float] = None
-    fetched_at: Optional[str] = None
-
-
-class DashboardItemOut(BaseModel):
-    media_type: str
-    media_id: str
-    preview_url: str
-    text_preview: str
-    created_at: str
-    published: bool
-    insights: InsightsOut
-
-
-class ChannelDashboardOut(BaseModel):
-    channel_id: str
-    channel_name: str
-    published_count: int
-    total_reach: int
-    total_impressions: int
-    total_interactions: int
-    total_likes: int
-    total_comments: int
-    total_saved: int
-    total_shares: int
-    avg_engagement_rate: Optional[float]
-    top_by_reach: List[DashboardItemOut]
-    top_by_engagement: List[DashboardItemOut]
-    top_by_likes: List[DashboardItemOut]
-    top_by_comments: List[DashboardItemOut]
-    top_by_saved: List[DashboardItemOut]
-    top_by_shares: List[DashboardItemOut]
-    last_refreshed: Optional[str]
-
-
-class SavedPost(BaseModel):
-    id: str
-    channel_id: str
-    channel_name: str
-    text: str
-    image_path: str
-    prompt: Optional[str] = None
-    ig_media_id: Optional[str] = None
-    insights: Optional[InsightsOut] = None
-    credits_consumed: float = 0.0
-    created_at: str
-    published: bool = False
-
-    class Config:
-        from_attributes = True
-
-
-class GenerateAvatarRequest(BaseModel):
-    prompt: str
-    channel_id: Optional[str] = None
-
-
-class UpdateAvatarRequest(BaseModel):
-    avatar_url: str
-
-
-class TestInstagramRequest(BaseModel):
-    instagram_user_id: Optional[str] = None
-    instagram_access_token: Optional[str] = None
-
-
-class GenerateVideoRequest(BaseModel):
-    channel_id: str
-    additional_prompt: Optional[str] = None
-    seconds: int = 4
-    size: str = "720x1280"
-
-
-class SavedVideo(BaseModel):
-    id: str
-    channel_id: str
-    channel_name: str
-    prompt: str
-    caption: str = ""
-    video_path: str
-    duration_seconds: int
-    size: str
-    credits_consumed: float = 0.0
-    created_at: str
-    published: bool = False
-    is_project_clip: bool = False
-    video_project_id: Optional[str] = None
-    ig_media_id: Optional[str] = None
-    insights: Optional[InsightsOut] = None
-
-    class Config:
-        from_attributes = True
-
-
-class UpdateVideoCaptionRequest(BaseModel):
-    caption: str
-
-
-class VideoProjectOut(BaseModel):
-    id: str
-    channel_id: str
-    title: str
-    clips: List[SavedVideo]
-    exported_path: Optional[str] = None
-    created_at: str
-    updated_at: str
-
-    class Config:
-        from_attributes = True
-
-
-class CreateVideoProjectRequest(BaseModel):
-    channel_id: str
-    video_id: str
-
-
-class UpdateVideoProjectClipsRequest(BaseModel):
-    clip_ids: List[str]
-
-
-class GenerateProjectClipRequest(BaseModel):
-    additional_prompt: Optional[str] = None
-    seconds: int = 4
-    size: str = "720x1280"
-
-
-class AddVideoToProjectRequest(BaseModel):
-    video_id: str
-
-
-class ReferenceImageOut(BaseModel):
-    id: int
-    channel_id: str
-    blob_url: str
-    description: Optional[str] = None
-    created_at: str
-
-    class Config:
-        from_attributes = True
-
-
-class AvatarInfo(BaseModel):
-    filename: str
-    url: str
-    created_at: Optional[str] = None
-
-
-class UpdatePostRequest(BaseModel):
-    text: Optional[str] = None
-    image_path: Optional[str] = None
-    published: Optional[bool] = None
-
-
-class GeneratePostImageRequest(BaseModel):
-    prompt: str
-    channel_id: str
-
-
-class CreditUsageOut(BaseModel):
-    id: int
-    user_id: int
-    channel_id: Optional[str] = None
-    channel_name: Optional[str] = None
-    resource_type: str
-    resource_id: Optional[str] = None
-    operation_type: str
-    model_name: str
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-    credits_consumed: float
-    metadata: dict
-    created_at: str
-
-    class Config:
-        from_attributes = True
-
-
-class PaymentCreate(BaseModel):
-    amount: float  # Valor em R$ (1 R$ = 1 crédito)
-
-
-class PaymentOut(BaseModel):
-    id: int
-    user_id: int
-    mp_payment_id: str
-    amount: float
-    credits_amount: float
-    status: str
-    qr_code: Optional[str] = None
-    qr_code_data: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ---------------------------------------------------------------------------
 # Credit tracking utilities
 # ---------------------------------------------------------------------------
 
@@ -776,90 +285,6 @@ def register_credit_usage(
     db.commit()
     
     return credits
-
-
-# ---------------------------------------------------------------------------
-# Auth utilities
-# ---------------------------------------------------------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer_scheme = HTTPBearer()
-
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
-
-
-def create_access_token(email: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS)
-    return jwt.encode({"sub": email, "exp": expire}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> UserDB:
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        email: str = payload.get("sub")
-        if not email:
-            raise HTTPException(status_code=401, detail="Token inválido")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido ou expirado")
-    user = db.query(UserDB).filter(UserDB.email == email).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuário não encontrado")
-    return user
-
-
-# ---------------------------------------------------------------------------
-# Settings helpers (per user, seeded from env on first access)
-# ---------------------------------------------------------------------------
-def _env_defaults() -> dict:
-    return {
-        "azure_openai_endpoint": os.getenv("AZURE_OPENAI_ENDPOINT", ""),
-        "azure_openai_api_key": os.getenv("AZURE_OPENAI_API_KEY", ""),
-        "azure_openai_deployment_name": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
-        "azure_openai_image_deployment": os.getenv("AZURE_OPENAI_IMAGE_DEPLOYMENT", "dall-e-3"),
-        "azure_openai_image_endpoint": os.getenv("AZURE_OPENAI_IMAGE_ENDPOINT", ""),
-        "azure_openai_api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-        "public_base_url": os.getenv("PUBLIC_BASE_URL", "http://localhost:8004"),
-    }
-
-
-def get_or_create_settings(user: UserDB, db: Session) -> SettingsDB:
-    s = db.query(SettingsDB).filter(SettingsDB.user_id == user.id).first()
-    if not s:
-        defaults = _env_defaults()
-        s = SettingsDB(user_id=user.id, **defaults)
-        db.add(s)
-        db.commit()
-        db.refresh(s)
-    return s
-
-
-# ---------------------------------------------------------------------------
-# Azure OpenAI client helper
-# ---------------------------------------------------------------------------
-def get_azure_client(s: SettingsDB) -> AzureOpenAI:
-    if not s.azure_openai_endpoint or not s.azure_openai_api_key:
-        raise HTTPException(status_code=400, detail="Azure OpenAI não configurado")
-    return AzureOpenAI(
-        azure_endpoint=s.azure_openai_endpoint,
-        api_key=s.azure_openai_api_key,
-        api_version=s.azure_openai_api_version,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1167,16 +592,6 @@ def post_to_schema(p: PostDB, insights=None) -> SavedPost:
     )
 
 
-def get_channel_or_404(channel_id: str, user: UserDB, db: Session) -> ChannelDB:
-    ch = db.query(ChannelDB).filter(
-        ChannelDB.id == channel_id,
-        ChannelDB.user_id == user.id,
-    ).first()
-    if not ch:
-        raise HTTPException(status_code=404, detail="Canal não encontrado")
-    return ch
-
-
 # ---------------------------------------------------------------------------
 # Root
 # ---------------------------------------------------------------------------
@@ -1244,14 +659,6 @@ def update_profile(
     db.commit()
     db.refresh(current_user)
     return UserOut.model_validate(current_user)
-
-
-ADMIN_EMAIL = "daniel.fabbri@avanade.com"
-
-
-def _require_admin(current_user: UserDB):
-    if current_user.email != ADMIN_EMAIL:
-        raise HTTPException(status_code=403, detail="Acesso negado")
 
 
 @app.get("/api/admin/users", response_model=list[UserOut])
@@ -3615,8 +3022,6 @@ def get_channel_credits(
 # ---------------------------------------------------------------------------
 # Instagram Webhooks - Respostas Automáticas
 # ---------------------------------------------------------------------------
-
-INSTAGRAM_WEBHOOK_VERIFY_TOKEN = os.getenv("INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "postgen_webhook_secret_2026")
 
 
 @app.get("/api/webhooks/instagram")
