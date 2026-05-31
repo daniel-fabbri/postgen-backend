@@ -66,7 +66,7 @@ def generate_image_bytes(
         resp = requests.post(
             s.azure_openai_image_endpoint,
             headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "n": 1, "size": size_str},
+            json={"prompt": prompt, "n": 1, "size": size_str, "model": s.azure_openai_image_deployment},
             timeout=60,
         )
         if not resp.ok:
