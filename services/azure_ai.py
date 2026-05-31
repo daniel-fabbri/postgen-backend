@@ -59,13 +59,20 @@ def generate_image_bytes(
         )
         return base64.b64decode(result.data[0].b64_json)
 
-    else:  # MAI
+    else:  # MAI / DALL-E compatible endpoint
         if not s.azure_openai_image_endpoint:
             raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
+        size_str = f"{width}x{height}"
         resp = requests.post(
             s.azure_openai_image_endpoint,
             headers={"Content-Type": "application/json", "api-key": s.azure_openai_api_key},
-            json={"prompt": prompt, "width": width, "height": height, "model": s.azure_openai_image_deployment},
+            json={
+                "prompt": prompt,
+                "n": 1,
+                "size": size_str,
+                "response_format": "b64_json",
+                "model": s.azure_openai_image_deployment,
+            },
             timeout=60,
         )
         resp.raise_for_status()

@@ -210,8 +210,11 @@ def generate_post_image(
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
     ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
-    channel_prompt = (ch.image_generation_prompt or "") if ch else ""
-    full_prompt = f"{channel_prompt}\n\n{data.prompt}" if (channel_prompt and data.prompt) else (channel_prompt or data.prompt)
+    # Combina: prompt de imagem do canal + contexto de texto (quem são os personagens) + prompt do usuário
+    image_prompt = (ch.image_generation_prompt or "") if ch else ""
+    text_context = (ch.text_generation_prompt or "") if ch else ""
+    parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
+    full_prompt = "\n\n".join(parts)
     if ch:
         full_prompt += get_reference_context(ch.id, db)
 
@@ -220,7 +223,8 @@ def generate_post_image(
     except HTTPException:
         raise
     except Exception as e:
-        if data.prompt and channel_prompt:
+        # Fallback: tenta só com o prompt do usuário + referências visuais
+        if data.prompt:
             try:
                 fallback_prompt = data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else "")
                 img_bytes = generate_image_bytes(fallback_prompt, ch, s, db)
