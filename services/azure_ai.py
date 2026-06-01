@@ -15,8 +15,8 @@ from models import ReferenceImageDB, SettingsDB, ChannelDB
 from services.blob_storage import upload_bytes_to_blob
 
 # Model IDs as used in Azure AI Foundry requests
-_FLUX_KONTEXT_MODEL = "black-forest-labs/flux-kontext-pro"
-_FLUX_2_PRO_MODEL = "black-forest-labs/flux-2-pro"
+_FLUX_KONTEXT_MODEL = "FLUX.1-Kontext-pro"
+_FLUX_2_PRO_MODEL = "FLUX.2-pro"
 
 
 def _call_foundry_images(payload: dict, timeout: int = 120) -> bytes:
