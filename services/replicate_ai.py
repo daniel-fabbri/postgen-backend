@@ -3,7 +3,8 @@ import requests
 from fastapi import HTTPException
 
 _REPLICATE_API = "https://api.replicate.com/v1"
-_CONSISTENT_CHARACTER_MODEL = "fofr/consistent-character"
+# Hash fixo da versão — obtido via GET /v1/models/fofr/consistent-character
+_CONSISTENT_CHARACTER_VERSION = "9c77a3c2f884193fcee4d89645f02a0b9def9434f9e03cb98460456b831c8772"
 
 # Timeout total de polling: 60 tentativas × 3s = 3 minutos
 _POLL_INTERVAL = 3
@@ -26,13 +27,14 @@ def generate_consistent_character(
     print(f"[REPLICATE] Iniciando consistent-character | subject={subject_url[:60]} | prompt={prompt[:80]}")
 
     create_resp = requests.post(
-        f"{_REPLICATE_API}/models/{_CONSISTENT_CHARACTER_MODEL}/predictions",
+        f"{_REPLICATE_API}/predictions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Prefer": "wait",  # espera até 60s na própria resposta antes de polling
         },
         json={
+            "version": _CONSISTENT_CHARACTER_VERSION,
             "input": {
                 "prompt": prompt,
                 "subject": subject_url,
