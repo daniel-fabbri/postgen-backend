@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config import GPT_IMAGE_2_API_KEY
+from config import GPT_IMAGE_2_API_KEY, AZURE_FOUNDRY_API_KEY
 from database import get_db
 from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
@@ -137,7 +137,11 @@ Return only the post text."""
     post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     blob_url = ""
     image_error = None
-    model_ready = s.azure_openai_image_endpoint or (ch.image_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
+    model_ready = (
+        s.azure_openai_image_endpoint
+        or (ch.image_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
+        or (ch.image_model in ("flux-kontext", "flux-2-pro") and AZURE_FOUNDRY_API_KEY)
+    )
     if not model_ready:
         image_error = "Endpoint de geração de imagem não configurado. Configure em Configurações → Azure OpenAI Image Endpoint."
         print(f"[IMAGE] Skipping image generation: {image_error}")
@@ -150,7 +154,9 @@ Return only the post text."""
         image_prompt += f"\n\nTema específico desta imagem: {main_subject}"
         if data.additional_prompt:
             image_prompt += f"\n\n{data.additional_prompt}"
-        image_prompt += get_reference_context(ch.id, db)
+        # Kontext recebe a imagem de referência diretamente — descrição em texto é desnecessária
+        if ch.image_model != "flux-kontext":
+            image_prompt += get_reference_context(ch.id, db)
         print(f"[IMAGE] Prompt ({len(image_prompt)} chars): {image_prompt[:300]}")
 
         def _try_generate(prompt: str) -> bytes:
@@ -248,8 +254,14 @@ def generate_post_image(
         print(f"[IMAGE REGEN] ✗ ERRO ao carregar settings: {str(e)}")
         raise
     
-    if not s.azure_openai_image_endpoint:
-        print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado")
+    _regen_model = ch.image_model if ch else "mai"
+    _regen_ready = (
+        s.azure_openai_image_endpoint
+        or (_regen_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
+        or (_regen_model in ("flux-kontext", "flux-2-pro") and AZURE_FOUNDRY_API_KEY)
+    )
+    if not _regen_ready:
+        print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado para modelo={_regen_model}")
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
 
     try:
@@ -267,7 +279,7 @@ def generate_post_image(
         text_context = (ch.text_generation_prompt or "") if ch else ""
         parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
         full_prompt = "\n\n".join(parts)
-        if ch:
+        if ch and ch.image_model != "flux-kontext":
             full_prompt += get_reference_context(ch.id, db)
         print(f"[IMAGE REGEN] ✓ Prompt construído ({len(full_prompt)} caracteres)")
         print(f"[IMAGE REGEN] Prompt preview: {full_prompt[:200]}...")
@@ -279,7 +291,8 @@ def generate_post_image(
     prompts_to_try = [full_prompt]
     # Fallbacks progressivos caso o prompt completo seja bloqueado por content safety
     if data.prompt:
-        prompts_to_try.append(data.prompt + (f"\n\n{get_reference_context(ch.id, db)}" if ch else ""))
+        ref_ctx = "" if (ch and ch.image_model == "flux-kontext") else (get_reference_context(ch.id, db) if ch else "")
+        prompts_to_try.append(data.prompt + (f"\n\n{ref_ctx}" if ref_ctx else ""))
     prompts_to_try.append(f"Artistic photo illustration: {data.prompt or 'scene'}")
     
     print(f"[IMAGE REGEN] Tentará {len(prompts_to_try)} variações de prompt")

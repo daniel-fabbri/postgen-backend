@@ -26,6 +26,10 @@ AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
 GPT_IMAGE_2_ENDPOINT = os.getenv("GPT_IMAGE_2_ENDPOINT", "https://postgen-ai.openai.azure.com").rstrip("/")
 GPT_IMAGE_2_API_KEY = os.getenv("GPT_IMAGE_2_API_KEY", "")
 
+# Azure AI Foundry — FLUX.1-Kontext-pro e FLUX.2-pro
+AZURE_FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT", "").rstrip("/")
+AZURE_FOUNDRY_API_KEY = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+
 INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
 INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
