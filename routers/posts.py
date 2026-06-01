@@ -254,6 +254,15 @@ def generate_post_image(
         print(f"[IMAGE REGEN] ✗ ERRO ao carregar settings: {str(e)}")
         raise
     
+    try:
+        ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+        print(f"[IMAGE REGEN] ✓ Canal encontrado: {ch.name if ch else 'None'}")
+        if ch:
+            print(f"[IMAGE REGEN] Modelo de imagem do canal: {ch.image_model or 'mai (padrão)'}")
+    except Exception as e:
+        print(f"[IMAGE REGEN] ✗ ERRO ao buscar canal: {str(e)}")
+        raise
+
     _regen_model = ch.image_model if ch else "mai"
     _regen_ready = (
         s.azure_openai_image_endpoint
@@ -263,15 +272,6 @@ def generate_post_image(
     if not _regen_ready:
         print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado para modelo={_regen_model}")
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
-
-    try:
-        ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
-        print(f"[IMAGE REGEN] ✓ Canal encontrado: {ch.name if ch else 'None'}")
-        if ch:
-            print(f"[IMAGE REGEN] Modelo de imagem do canal: {ch.image_model or 'mai (padrão)'}")
-    except Exception as e:
-        print(f"[IMAGE REGEN] ✗ ERRO ao buscar canal: {str(e)}")
-        raise
     
     # Combina: prompt de imagem do canal + contexto de texto (quem são os personagens) + prompt do usuário
     try:
