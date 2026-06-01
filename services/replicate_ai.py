@@ -88,6 +88,77 @@ def generate_consistent_character(
     raise HTTPException(status_code=504, detail="Replicate prediction não concluiu em 3 minutos")
 
 
+_FACESWAP_VERSION = "9a4298548422074c3f57258c5d544497314ae4112df80d116f0d2109e843d20d"
+
+
+def apply_face_swap(
+    target_image_url: str,
+    swap_image_url: str,
+    api_key: str,
+) -> bytes:
+    """
+    Aplica o rosto de swap_image_url na cena de target_image_url.
+    target_image_url: imagem do post (cena gerada)
+    swap_image_url:   foto de referência do rosto
+    """
+    if not api_key:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor")
+
+    print(f"[REPLICATE] face-swap | target={target_image_url[:60]} | swap={swap_image_url[:60]}")
+
+    create_resp = requests.post(
+        f"{_REPLICATE_API}/predictions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Prefer": "wait",
+        },
+        json={
+            "version": _FACESWAP_VERSION,
+            "input": {
+                "target_image": target_image_url,
+                "swap_image": swap_image_url,
+            },
+        },
+        timeout=90,
+    )
+
+    if not create_resp.ok:
+        raise HTTPException(
+            status_code=create_resp.status_code,
+            detail=f"Replicate face-swap error: {create_resp.text[:400]}",
+        )
+
+    prediction = create_resp.json()
+    status = prediction.get("status")
+    prediction_id = prediction.get("id")
+    print(f"[REPLICATE] face-swap prediction {prediction_id} status={status}")
+
+    if status == "succeeded":
+        return _download_output(prediction)
+    if status in ("failed", "canceled"):
+        raise HTTPException(status_code=500, detail=f"Replicate face-swap falhou: {prediction.get('error')}")
+
+    for attempt in range(_POLL_MAX):
+        time.sleep(_POLL_INTERVAL)
+        poll = requests.get(
+            f"{_REPLICATE_API}/predictions/{prediction_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if not poll.ok:
+            continue
+        result = poll.json()
+        status = result.get("status")
+        print(f"[REPLICATE] face-swap poll {attempt+1} status={status}")
+        if status == "succeeded":
+            return _download_output(result)
+        if status in ("failed", "canceled"):
+            raise HTTPException(status_code=500, detail=f"Replicate face-swap falhou: {result.get('error')}")
+
+    raise HTTPException(status_code=504, detail="Replicate face-swap não concluiu em 3 minutos")
+
+
 def _download_output(prediction: dict) -> bytes:
     output = prediction.get("output") or []
     if not output:

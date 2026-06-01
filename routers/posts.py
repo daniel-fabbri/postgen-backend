@@ -13,7 +13,7 @@ from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
     get_channel_or_404, get_post_or_404,
 )
-from models import UserDB, ChannelDB, PostDB, MediaInsightsDB
+from models import UserDB, ChannelDB, PostDB, MediaInsightsDB, ReferenceImageDB
 from schemas import (
     GeneratePostRequest, Post, SavedPost, UpdatePostRequest, GeneratePostImageRequest,
 )
@@ -359,6 +359,58 @@ def generate_post_image(
     
     print(f"[IMAGE REGEN] ✓✓✓ SUCESSO TOTAL! Retornando URL")
     print(f"{'='*80}\n")
+    return {"success": True, "image_url": blob_url, "image_path": blob_url}
+
+
+@router.post("/api/posts/{post_id}/image/face-apply")
+def face_apply_post_image(
+    post_id: str,
+    data: GeneratePostImageRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Aplica o rosto da imagem de referência do canal na imagem atual do post (face swap)."""
+    if not REPLICATE_API_KEY:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor")
+
+    p = get_post_or_404(post_id, current_user, db)
+    if not p.image_path:
+        raise HTTPException(status_code=400, detail="Post não tem imagem para aplicar o rosto")
+
+    ch = db.query(ChannelDB).filter(ChannelDB.id == data.channel_id).first()
+    if not ch:
+        raise HTTPException(status_code=404, detail="Canal não encontrado")
+
+    refs = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.channel_id == ch.id,
+    ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+    if not refs:
+        raise HTTPException(status_code=400, detail="Canal sem imagens de referência. Adicione fotos do rosto na aba Referências.")
+
+    target_url = p.image_path if p.image_path.startswith("http") else None
+    if not target_url:
+        raise HTTPException(status_code=400, detail="URL da imagem do post não é pública")
+
+    print(f"[FACE_APPLY] post={post_id} target={target_url[:60]} swap={refs[0].blob_url[:60]}")
+
+    from services.replicate_ai import apply_face_swap
+    img_bytes = apply_face_swap(
+        target_image_url=target_url,
+        swap_image_url=refs[0].blob_url,
+        api_key=REPLICATE_API_KEY,
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}_face.png", "image/png")
+    p.image_path = blob_url
+    register_credit_usage(
+        db=db, user_id=current_user.id, channel_id=ch.id,
+        resource_type="post", resource_id=post_id,
+        operation_type="face_apply", model_name="replicate/faceswap",
+        images_count=1, metadata={"type": "face_swap"},
+    )
+    db.commit()
+    print(f"[FACE_APPLY] ✓ Concluído: {blob_url[:60]}")
     return {"success": True, "image_url": blob_url, "image_path": blob_url}
 
 
