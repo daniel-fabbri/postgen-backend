@@ -69,18 +69,12 @@ def generate_image_bytes(
         ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
 
         if refs:
-            print(f"[GEN_IMAGE] Kontext: image-to-image com referência {refs[0].id}")
-            ref_bytes = requests.get(refs[0].blob_url, timeout=20).content
-            ref_b64 = base64.b64encode(ref_bytes).decode()
-            # Detecta formato pela URL (jpg por padrão)
-            mime = "image/jpeg" if refs[0].blob_url.lower().endswith(".jpg") or ".jpg" in refs[0].blob_url.lower() else "image/png"
-            data_uri = f"data:{mime};base64,{ref_b64}"
-
+            print(f"[GEN_IMAGE] Kontext: image-to-image com referência {refs[0].id} url={refs[0].blob_url[:60]}")
             payload = {
                 "model": _FLUX_KONTEXT_MODEL,
                 "prompt": prompt,
                 "n": 1,
-                "image": data_uri,
+                "image": refs[0].blob_url,  # URL direta — confirmado que a API aceita
             }
         else:
             print(f"[GEN_IMAGE] Kontext: sem referência, usando text-to-image")

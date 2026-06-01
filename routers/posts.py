@@ -146,16 +146,19 @@ Return only the post text."""
         image_error = "Endpoint de geração de imagem não configurado. Configure em Configurações → Azure OpenAI Image Endpoint."
         print(f"[IMAGE] Skipping image generation: {image_error}")
     else:
-        # Combina prompts do canal: visual (image_prompt) + contexto de personagens (text_prompt) + assunto do post
-        base_image = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}."
-        base_text = ch.text_generation_prompt or ""
-        parts = [p for p in [base_image, base_text] if p.strip()]
-        image_prompt = "\n\n".join(parts)
-        image_prompt += f"\n\nTema específico desta imagem: {main_subject}"
-        if data.additional_prompt:
-            image_prompt += f"\n\n{data.additional_prompt}"
-        # Kontext recebe a imagem de referência diretamente — descrição em texto é desnecessária
-        if ch.image_model != "flux-kontext":
+        if ch.image_model == "flux-kontext":
+            # Kontext usa a foto de referência para a aparência — o prompt deve descrever só a cena
+            image_prompt = main_subject
+            if data.additional_prompt:
+                image_prompt += f". {data.additional_prompt}"
+        else:
+            base_image = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}."
+            base_text = ch.text_generation_prompt or ""
+            parts = [p for p in [base_image, base_text] if p.strip()]
+            image_prompt = "\n\n".join(parts)
+            image_prompt += f"\n\nTema específico desta imagem: {main_subject}"
+            if data.additional_prompt:
+                image_prompt += f"\n\n{data.additional_prompt}"
             image_prompt += get_reference_context(ch.id, db)
         print(f"[IMAGE] Prompt ({len(image_prompt)} chars): {image_prompt[:300]}")
 
@@ -273,14 +276,17 @@ def generate_post_image(
         print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado para modelo={_regen_model}")
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
     
-    # Combina: prompt de imagem do canal + contexto de texto (quem são os personagens) + prompt do usuário
     try:
-        image_prompt = (ch.image_generation_prompt or "") if ch else ""
-        text_context = (ch.text_generation_prompt or "") if ch else ""
-        parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
-        full_prompt = "\n\n".join(parts)
-        if ch and ch.image_model != "flux-kontext":
-            full_prompt += get_reference_context(ch.id, db)
+        if ch and ch.image_model == "flux-kontext":
+            # Kontext usa a foto de referência para a aparência — prompt deve descrever só a cena
+            full_prompt = data.prompt
+        else:
+            image_prompt = (ch.image_generation_prompt or "") if ch else ""
+            text_context = (ch.text_generation_prompt or "") if ch else ""
+            parts = [p for p in [image_prompt, text_context, data.prompt] if p.strip()]
+            full_prompt = "\n\n".join(parts)
+            if ch:
+                full_prompt += get_reference_context(ch.id, db)
         print(f"[IMAGE REGEN] ✓ Prompt construído ({len(full_prompt)} caracteres)")
         print(f"[IMAGE REGEN] Prompt preview: {full_prompt[:200]}...")
     except Exception as e:
@@ -290,9 +296,8 @@ def generate_post_image(
     img_bytes = None
     prompts_to_try = [full_prompt]
     # Fallbacks progressivos caso o prompt completo seja bloqueado por content safety
-    if data.prompt:
-        ref_ctx = "" if (ch and ch.image_model == "flux-kontext") else (get_reference_context(ch.id, db) if ch else "")
-        prompts_to_try.append(data.prompt + (f"\n\n{ref_ctx}" if ref_ctx else ""))
+    if data.prompt and full_prompt != data.prompt:
+        prompts_to_try.append(data.prompt)
     prompts_to_try.append(f"Artistic photo illustration: {data.prompt or 'scene'}")
     
     print(f"[IMAGE REGEN] Tentará {len(prompts_to_try)} variações de prompt")
