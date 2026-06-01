@@ -74,7 +74,7 @@ def generate_image_bytes(
                 "model": _FLUX_KONTEXT_MODEL,
                 "prompt": prompt,
                 "n": 1,
-                "image": refs[0].blob_url,  # URL direta — confirmado que a API aceita
+                "image": {"url": refs[0].blob_url},  # objeto {"url": "..."} — formato correto confirmado por teste
             }
         else:
             print(f"[GEN_IMAGE] Kontext: sem referência, usando text-to-image")
