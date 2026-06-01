@@ -6,11 +6,9 @@ from typing import Optional
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from config import AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_API_KEY
+from config import GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY
 from models import ReferenceImageDB, SettingsDB, ChannelDB
 from services.blob_storage import upload_bytes_to_blob
-
-_IMAGE_MODEL = "MAI-Image-2e"
 
 
 def generate_image_bytes(
@@ -21,42 +19,31 @@ def generate_image_bytes(
     width: int = 1024,
     height: int = 1024,
 ) -> bytes:
-    """Gera imagem via gpt-image-1 no Azure AI Foundry."""
-    if not AZURE_FOUNDRY_ENDPOINT or not AZURE_FOUNDRY_API_KEY:
-        raise HTTPException(status_code=400, detail="Azure AI Foundry não configurado (AZURE_FOUNDRY_ENDPOINT / AZURE_FOUNDRY_API_KEY)")
+    """Gera imagem via gpt-image-2 no Azure OpenAI."""
+    if not GPT_IMAGE_2_API_KEY:
+        raise HTTPException(status_code=400, detail="GPT_IMAGE_2_API_KEY não configurado no servidor")
 
-    print(f"[GEN_IMAGE] modelo={_IMAGE_MODEL} size={width}x{height} prompt={len(prompt)}chars")
+    print(f"[GEN_IMAGE] modelo=gpt-image-2 prompt={len(prompt)}chars")
 
-    payload = {
-        "model": _IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "size": "1024x1024",
-    }
+    try:
+        from openai import AzureOpenAI as _AzOAI
+        client = _AzOAI(
+            azure_endpoint=GPT_IMAGE_2_ENDPOINT,
+            api_key=GPT_IMAGE_2_API_KEY,
+            api_version="2025-04-01-preview",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao criar cliente Azure OpenAI: {e}")
 
-    resp = requests.post(
-        AZURE_FOUNDRY_ENDPOINT,
-        headers={"Content-Type": "application/json", "api-key": AZURE_FOUNDRY_API_KEY},
-        json=payload,
-        timeout=120,
+    result = client.images.generate(
+        model="gpt-image-2",
+        prompt=prompt,
+        n=1,
+        size="1024x1024",
     )
-
-    if not resp.ok:
-        raise HTTPException(status_code=resp.status_code, detail=f"Erro na geração de imagem: {resp.text[:400]}")
-
-    result = resp.json()
-    if not result.get("data"):
-        raise HTTPException(status_code=500, detail="Sem dados de imagem na resposta")
-
-    item = result["data"][0]
-    if "b64_json" in item:
-        return base64.b64decode(item["b64_json"])
-    if "url" in item:
-        img_resp = requests.get(item["url"], timeout=60)
-        img_resp.raise_for_status()
-        return img_resp.content
-
-    raise HTTPException(status_code=500, detail=f"Formato inesperado na resposta: {list(item.keys())}")
+    img_bytes = base64.b64decode(result.data[0].b64_json)
+    print(f"[GEN_IMAGE] ✓ {len(img_bytes)} bytes")
+    return img_bytes
 
 
 def get_reference_context(channel_id: str, db: Session) -> str:

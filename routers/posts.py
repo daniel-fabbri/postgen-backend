@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config import AZURE_FOUNDRY_API_KEY, REPLICATE_API_KEY
+from config import GPT_IMAGE_2_API_KEY, AZURE_FOUNDRY_API_KEY, REPLICATE_API_KEY
 from database import get_db
 from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
@@ -137,9 +137,9 @@ Return only the post text."""
     post_id = f"post_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     blob_url = ""
     image_error = None
-    model_ready = bool(AZURE_FOUNDRY_API_KEY)
+    model_ready = bool(GPT_IMAGE_2_API_KEY)
     if not model_ready:
-        image_error = "AZURE_FOUNDRY_API_KEY não configurado no servidor."
+        image_error = "GPT_IMAGE_2_API_KEY não configurado no servidor."
         print(f"[IMAGE] Skipping image generation: {image_error}")
     else:
         base_image = ch.image_generation_prompt or f"Instagram post image for {ch.name}. Theme: {ch.objective}."
@@ -177,7 +177,7 @@ Return only the post text."""
         if img_bytes:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}.png", "image/png")
-            image_model = "gpt-image-1"
+            image_model = "gpt-image-2"
             total_credits += register_credit_usage(
                 db=db, user_id=current_user.id, channel_id=ch.id,
                 resource_type="post", resource_id=post_id,
@@ -254,8 +254,8 @@ def generate_post_image(
         print(f"[IMAGE REGEN] ✗ ERRO ao buscar canal: {str(e)}")
         raise
 
-    if not AZURE_FOUNDRY_API_KEY:
-        raise HTTPException(status_code=400, detail="AZURE_FOUNDRY_API_KEY não configurado no servidor")
+    if not GPT_IMAGE_2_API_KEY:
+        raise HTTPException(status_code=400, detail="GPT_IMAGE_2_API_KEY não configurado no servidor")
 
     try:
         image_prompt = (ch.image_generation_prompt or "") if ch else ""
@@ -318,7 +318,7 @@ def generate_post_image(
     try:
         p.image_path = blob_url
         p.prompt = full_prompt
-        image_model = "gpt-image-1"
+        image_model = "gpt-image-2"
         credits = register_credit_usage(
             db=db, user_id=current_user.id, channel_id=ch.id if ch else None,
             resource_type="post", resource_id=post_id,
