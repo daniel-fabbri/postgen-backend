@@ -10,7 +10,7 @@ from config import AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_API_KEY
 from models import ReferenceImageDB, SettingsDB, ChannelDB
 from services.blob_storage import upload_bytes_to_blob
 
-_IMAGE_MODEL = "gpt-image-1"
+_IMAGE_MODEL = "MAI-Image-2e"
 
 
 def generate_image_bytes(
