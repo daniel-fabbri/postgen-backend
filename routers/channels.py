@@ -10,15 +10,22 @@ from urllib.parse import urlencode
 
 from config import (
     BASE_URL, FRONTEND_URL, INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET,
-    JWT_SECRET, JWT_ALGORITHM, AZURE_STORAGE_CONTAINER,
+    JWT_SECRET, JWT_ALGORITHM, AZURE_STORAGE_CONTAINER, REPLICATE_API_KEY,
 )
 from database import get_db
 from dependencies import get_current_user, get_or_create_settings, get_channel_or_404
 from models import UserDB, ChannelDB, AvatarDB, ReferenceImageDB
+from pydantic import BaseModel as _BM
+
 from schemas import (
     Channel, UpdateAvatarRequest, TestInstagramRequest, AvatarInfo,
     ReferenceImageOut, GenerateAvatarRequest,
 )
+
+
+class AvatarFaceApplyRequest(_BM):
+    avatar_url: str
+    channel_id: str
 from services.azure_ai import generate_image_bytes, get_reference_context
 from services.blob_storage import upload_bytes_to_blob
 from services.converters import channel_to_schema
@@ -411,6 +418,42 @@ def upload_avatar(
         ch.avatar_url = avatar_url
         db.commit()
     return {"success": True, "avatar_url": avatar_url, "filename": avatar_filename}
+
+
+@router.post("/api/avatars/face-apply")
+def face_apply_avatar(
+    data: AvatarFaceApplyRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Aplica o rosto de referência do canal em um avatar existente via face swap."""
+    if not REPLICATE_API_KEY:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor")
+
+    ch = get_channel_or_404(data.channel_id, current_user, db)
+
+    refs = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.channel_id == ch.id,
+    ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+    if not refs:
+        raise HTTPException(status_code=400, detail="Canal sem imagens de referência. Adicione fotos do rosto na aba Referências.")
+
+    if not data.avatar_url.startswith("http"):
+        raise HTTPException(status_code=400, detail="URL do avatar inválida")
+
+    from services.replicate_ai import apply_face_swap
+    img_bytes = apply_face_swap(
+        target_image_url=data.avatar_url,
+        swap_image_url=refs[0].blob_url,
+        api_key=REPLICATE_API_KEY,
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    avatar_filename = f"avatar_face_{ts}.png"
+    new_avatar_url = upload_bytes_to_blob(img_bytes, f"avatars/{avatar_filename}", "image/png")
+    _register_avatar(avatar_filename, data.channel_id, db)
+
+    return {"success": True, "avatar_url": new_avatar_url, "filename": avatar_filename}
 
 
 # ---------------------------------------------------------------------------
