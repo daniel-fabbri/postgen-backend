@@ -30,6 +30,9 @@ GPT_IMAGE_2_API_KEY = os.getenv("GPT_IMAGE_2_API_KEY", "")
 AZURE_FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT", "").rstrip("/")
 AZURE_FOUNDRY_API_KEY = os.getenv("AZURE_FOUNDRY_API_KEY", "")
 
+# Replicate — fofr/consistent-character (geração com rosto consistente)
+REPLICATE_API_KEY = os.getenv("REPLICATE_API_KEY", "")
+
 INSTAGRAM_APP_ID = os.getenv("INSTAGRAM_APP_ID", "")
 INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")

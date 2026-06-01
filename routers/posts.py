@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config import GPT_IMAGE_2_API_KEY, AZURE_FOUNDRY_API_KEY
+from config import GPT_IMAGE_2_API_KEY, AZURE_FOUNDRY_API_KEY, REPLICATE_API_KEY
 from database import get_db
 from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
@@ -141,13 +141,14 @@ Return only the post text."""
         s.azure_openai_image_endpoint
         or (ch.image_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
         or (ch.image_model in ("flux-kontext", "flux-2-pro") and AZURE_FOUNDRY_API_KEY)
+        or (ch.image_model == "consistent-character" and REPLICATE_API_KEY)
     )
     if not model_ready:
         image_error = "Endpoint de geração de imagem não configurado. Configure em Configurações → Azure OpenAI Image Endpoint."
         print(f"[IMAGE] Skipping image generation: {image_error}")
     else:
-        if ch.image_model == "flux-kontext":
-            # Kontext usa a foto de referência para a aparência — o prompt deve descrever só a cena
+        if ch.image_model in ("flux-kontext", "consistent-character"):
+            # Estes modelos usam a foto de referência para a aparência — prompt deve descrever só a cena
             image_prompt = main_subject
             if data.additional_prompt:
                 image_prompt += f". {data.additional_prompt}"
@@ -271,14 +272,15 @@ def generate_post_image(
         s.azure_openai_image_endpoint
         or (_regen_model == "gpt-image-2" and GPT_IMAGE_2_API_KEY)
         or (_regen_model in ("flux-kontext", "flux-2-pro") and AZURE_FOUNDRY_API_KEY)
+        or (_regen_model == "consistent-character" and REPLICATE_API_KEY)
     )
     if not _regen_ready:
         print(f"[IMAGE REGEN] ✗ Endpoint de imagem não configurado para modelo={_regen_model}")
         raise HTTPException(status_code=400, detail="Endpoint de imagem não configurado")
     
     try:
-        if ch and ch.image_model == "flux-kontext":
-            # Kontext usa a foto de referência para a aparência — prompt deve descrever só a cena
+        if ch and ch.image_model in ("flux-kontext", "consistent-character"):
+            # Estes modelos usam a foto de referência para a aparência — prompt deve descrever só a cena
             full_prompt = data.prompt
         else:
             image_prompt = (ch.image_generation_prompt or "") if ch else ""

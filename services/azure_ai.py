@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from config import (
     GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY,
     AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_API_KEY,
+    REPLICATE_API_KEY,
 )
 from models import ReferenceImageDB, SettingsDB, ChannelDB
 from services.blob_storage import upload_bytes_to_blob
@@ -59,6 +60,25 @@ def generate_image_bytes(
     """Roteia geração de imagem para o modelo correto do canal."""
     model = (ch.image_model or "mai") if ch else "mai"
     print(f"[GEN_IMAGE] modelo={model} size={width}x{height} prompt={len(prompt)}chars")
+
+    # ------------------------------------------------------------------
+    # Replicate — fofr/consistent-character (rosto idêntico à referência)
+    # ------------------------------------------------------------------
+    if model == "consistent-character":
+        from services.replicate_ai import generate_consistent_character
+        refs = db.query(ReferenceImageDB).filter(
+            ReferenceImageDB.channel_id == ch.id,
+        ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
+        if not refs:
+            raise HTTPException(
+                status_code=400,
+                detail="Canal sem imagens de referência. Adicione fotos do personagem na aba Referências antes de usar Consistent Character.",
+            )
+        return generate_consistent_character(
+            prompt=prompt,
+            subject_url=refs[0].blob_url,
+            api_key=REPLICATE_API_KEY,
+        )
 
     # ------------------------------------------------------------------
     # FLUX.1-Kontext-pro — image-to-image com rosto fixo de referência
