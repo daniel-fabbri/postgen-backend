@@ -60,6 +60,17 @@ def get_post(
     return post_to_schema(get_post_or_404(post_id, current_user, db))
 
 
+@router.delete("/api/posts/{post_id}", status_code=204)
+def delete_post(
+    post_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    p = get_post_or_404(post_id, current_user, db)
+    db.delete(p)
+    db.commit()
+
+
 @router.patch("/api/posts/{post_id}", response_model=SavedPost)
 @router.post("/api/posts/{post_id}/save", response_model=SavedPost)
 def update_post(
