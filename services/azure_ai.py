@@ -1,4 +1,6 @@
 import base64
+import io
+import json
 import requests
 from datetime import datetime
 from typing import Optional
@@ -6,7 +8,11 @@ from typing import Optional
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from config import GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY
+from config import (
+    GPT_IMAGE_2_ENDPOINT, GPT_IMAGE_2_API_KEY,
+    AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
+    AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION,
+)
 from models import ReferenceImageDB, SettingsDB, ChannelDB
 from services.blob_storage import upload_bytes_to_blob
 
@@ -58,6 +64,122 @@ def get_reference_context(channel_id: str, db: Session) -> str:
     if not descriptions:
         return ""
     return "\n\nVisual reference for the person/character in this image: " + " ".join(descriptions)
+
+
+def _detect_faces_opencv(image_url: str) -> list:
+    """Baixa a imagem e detecta todas as faces com OpenCV Haar Cascade (local, sem API)."""
+    import cv2
+    import numpy as np
+
+    resp = requests.get(image_url, timeout=30)
+    resp.raise_for_status()
+
+    img_array = np.frombuffer(resp.content, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    # scaleFactor=1.05 + minNeighbors=3 para ser mais sensível a faces menores
+    detections = cascade.detectMultiScale(
+        gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40)
+    )
+
+    faces = []
+    for (x, y, fw, fh) in (detections if len(detections) > 0 else []):
+        faces.append({
+            "x": float(x) / w,
+            "y": float(y) / h,
+            "w": float(fw) / w,
+            "h": float(fh) / h,
+        })
+    return faces
+
+
+def identify_main_person_bbox(image_url: str, person_description: str = "") -> Optional[dict]:
+    """
+    Detecta faces com OpenCV e retorna a bounding box da face mais proeminente
+    (maior área × mais central = sujeito principal do post).
+    Retorna {"x": f, "y": f, "w": f, "h": f} como frações 0-1, ou None.
+    """
+    try:
+        faces = _detect_faces_opencv(image_url)
+        print(f"[VISION] OpenCV detectou {len(faces)} face(s)")
+
+        if not faces:
+            return None
+
+        if len(faces) == 1:
+            print(f"[VISION] Face única: {faces[0]}")
+            return faces[0]
+
+        # Múltiplas faces: maior área com peso para centralidade (sujeito principal)
+        best, best_score = None, -1
+        for face in faces:
+            area = face["w"] * face["h"]
+            face_cx = face["x"] + face["w"] / 2
+            face_cy = face["y"] + face["h"] / 2
+            dist = ((face_cx - 0.5) ** 2 + (face_cy - 0.5) ** 2) ** 0.5
+            centrality = 1 - dist / (0.5 * 2 ** 0.5)
+            score = area * (0.7 + 0.3 * centrality)
+            if score > best_score:
+                best_score = score
+                best = face
+
+        print(f"[VISION] Face principal: {best}")
+        return best
+
+    except Exception as e:
+        print(f"[VISION] detect_faces_opencv falhou: {e}")
+        return None
+
+
+def create_inpaint_mask(bbox: dict, image_size: int = 1024) -> bytes:
+    """
+    Cria uma máscara PNG para inpainting: branco onde o rosto está (região a alterar),
+    preto no resto (preservar cena, texto, outras pessoas).
+    A elipse é centrada no centro do rosto detectado, não deslocada pelo clipping das bordas.
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+
+    x = int(bbox["x"] * image_size)
+    y = int(bbox["y"] * image_size)
+    w = int(bbox["w"] * image_size)
+    h = int(bbox["h"] * image_size)
+
+    # Centro do rosto detectado, deslocado levemente para cima (inclui testa/cabelo)
+    cx = x + w // 2
+    cy = y + h // 2 - int(h * 0.05)
+
+    # Semi-eixos: 60% da largura e 65% da altura do bbox
+    # → elipse ~20% mais larga e ~30% mais alta que o rosto detectado
+    # Antes era ~75% e ~85% (muito invasivo com rostos vizinhos)
+    rx = int(w * 0.60)
+    ry = int(h * 0.65)
+
+    # Bounding box da elipse centrada no rosto — clipping simétrico nas bordas
+    x1 = max(0, cx - rx)
+    y1 = max(0, cy - ry)
+    x2 = min(image_size, cx + rx)
+    y2 = min(image_size, cy + ry)
+
+    mask = Image.new("L", (image_size, image_size), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse([x1, y1, x2, y2], fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=10))
+
+    mask_rgb = Image.new("RGB", (image_size, image_size), (0, 0, 0))
+    mask_rgb.paste((255, 255, 255), mask=mask)
+
+    buf = io.BytesIO()
+    mask_rgb.save(buf, format="PNG")
+    print(f"[VISION] Máscara: centro=({cx},{cy}) rx={rx} ry={ry} bbox=({x1},{y1})→({x2},{y2})")
+    return buf.getvalue()
 
 
 def save_image_from_base64(base64_data: str, post_id: str) -> str:
