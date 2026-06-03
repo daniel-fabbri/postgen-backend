@@ -533,7 +533,7 @@ def _download_output(prediction: dict) -> bytes:
 
 def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
     """
-    Aplica lipsync no vídeo usando bytedance/latentsync no Replicate.
+    Aplica lipsync no vídeo usando zsxkib/latentsync no Replicate.
     video_url: URL pública do vídeo MP4 gerado pelo MiniMax.
     audio_url: URL pública do áudio MP3 com a voz clonada.
     Retorna bytes do vídeo MP4 com lipsync + áudio embutido.
@@ -544,15 +544,15 @@ def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
     print(f"[REPLICATE] latentsync | video={video_url[:60]} | audio={audio_url[:60]}")
 
     create_resp = requests.post(
-        f"{_REPLICATE_API}/models/bytedance/latentsync/predictions",
+        f"{_REPLICATE_API}/models/zsxkib/latentsync/predictions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         json={
             "input": {
-                "video": video_url,
-                "audio": audio_url,
+                "video_path": video_url,
+                "audio_path": audio_url,
                 "guidance_scale": 1.5,
                 "inference_steps": 20,
             }
