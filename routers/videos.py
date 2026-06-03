@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config import AZURE_SORA_ENDPOINT, AZURE_SORA_API_KEY
+from config import AZURE_SORA_ENDPOINT, AZURE_SORA_API_KEY, REPLICATE_API_KEY
 from database import get_db
 from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
@@ -24,6 +24,7 @@ from schemas import (
     GenerateProjectClipRequest, AddVideoToProjectRequest,
 )
 from services.blob_storage import upload_bytes_to_blob
+from services.replicate_ai import generate_with_lora, generate_video_from_image
 from services.converters import video_to_schema, video_project_to_schema
 from services.credits import register_credit_usage
 from services.instagram import ig_api_base
@@ -202,6 +203,130 @@ Retorne apenas o texto da legenda."""
         id=video_id, channel_id=ch.id, channel_name=ch.name,
         prompt=prompt, caption=caption, video_path=blob_url,
         duration_seconds=data.seconds, size=data.size,
+        published=False, credits_consumed=total_credits,
+    )
+    db.add(v)
+    db.commit()
+    db.execute(
+        text("UPDATE credit_usage SET resource_id = :video_id WHERE resource_id IS NULL AND user_id = :user_id AND channel_id = :channel_id"),
+        {"video_id": video_id, "user_id": current_user.id, "channel_id": ch.id},
+    )
+    db.commit()
+    db.refresh(v)
+    return video_to_schema(v)
+
+
+_VIDEO_WITH_CHARACTER_DURATION = 6  # minimax/video-01 gera ~6s fixos
+
+
+@router.post("/api/videos/generate-with-character", response_model=SavedVideo)
+def generate_video_with_character(
+    data: GenerateVideoRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Gera vídeo com personagem do canal via LoRA + minimax/video-01.
+    Requer LoRA treinado (ch.lora_status == "succeeded").
+    Fluxo:
+      1. Gera frame portrait (9:16) via LoRA com trigger word TOK
+      2. Anima o frame com minimax/video-01
+      3. Gera legenda via GPT-4o
+    """
+    ch = get_channel_or_404(data.channel_id, current_user, db)
+    s = get_or_create_settings(current_user, db)
+
+    if ch.lora_status != "succeeded" or not ch.lora_version:
+        raise HTTPException(
+            status_code=400,
+            detail="Canal sem personagem treinado. Treine o LoRA primeiro nas configurações do canal.",
+        )
+    if not REPLICATE_API_KEY:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor.")
+
+    # 1. Prompt para o frame de referência (inclui trigger word TOK do LoRA)
+    base_prompt = ch.image_generation_prompt or f"portrait of TOK, {ch.objective}"
+    lora_frame_prompt = f"TOK, {base_prompt}"
+    if data.additional_prompt:
+        lora_frame_prompt += f", {data.additional_prompt}"
+    lora_frame_prompt = lora_frame_prompt[:2000]
+
+    print(f"[VIDEO-WITH-CHARACTER] Step 1 – frame LoRA | channel={ch.id}")
+
+    # 2. Gerar frame portrait via LoRA
+    lora_image_bytes = generate_with_lora(
+        prompt=lora_frame_prompt,
+        lora_ref=ch.lora_version,
+        api_key=REPLICATE_API_KEY,
+        aspect_ratio="9:16",
+    )
+    frame_id = f"charframe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    frame_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}.png", "image/png")
+    print(f"[VIDEO-WITH-CHARACTER] Frame gerado: {frame_url[:60]}")
+
+    # 3. Prompt de movimento para o vídeo
+    motion_prompt = ch.image_generation_prompt or f"Cinematic motion, {ch.objective}."
+    if data.additional_prompt:
+        motion_prompt += f" {data.additional_prompt}"
+    motion_prompt = motion_prompt[:2000]
+
+    print(f"[VIDEO-WITH-CHARACTER] Step 2 – minimax/video-01 | prompt={motion_prompt[:80]}")
+
+    # 4. Animar o frame
+    video_bytes = generate_video_from_image(
+        image_url=frame_url,
+        prompt=motion_prompt,
+        api_key=REPLICATE_API_KEY,
+    )
+
+    # 5. Legenda via GPT-4o
+    caption = ""
+    total_credits = 0.0
+    try:
+        client = get_azure_client(s)
+        text_prompt = ch.text_generation_prompt or f"""Crie uma legenda para um Instagram Reel do canal "{ch.name}".
+Objetivo do canal: {ch.objective}
+Conceito do vídeo: {data.additional_prompt or motion_prompt}
+Escreva uma legenda envolvente com emojis e hashtags relevantes, 80-150 palavras.
+Retorne apenas o texto da legenda."""
+        cap_resp = client.chat.completions.create(
+            model=s.azure_openai_deployment_name,
+            messages=[
+                {"role": "system", "content": "Você é um especialista em conteúdo para Instagram."},
+                {"role": "user", "content": text_prompt},
+            ],
+            max_tokens=400, temperature=0.7,
+        )
+        caption = cap_resp.choices[0].message.content.strip()
+        cap_usage = cap_resp.usage
+        total_credits += register_credit_usage(
+            db=db, user_id=current_user.id, channel_id=ch.id,
+            resource_type="video", resource_id=None,
+            operation_type="text_generation", model_name=s.azure_openai_deployment_name,
+            input_tokens=cap_usage.prompt_tokens, output_tokens=cap_usage.completion_tokens,
+            metadata={"step": "video_caption_generation"},
+        )
+    except Exception as e:
+        print(f"[VIDEO-WITH-CHARACTER] Caption generation failed: {e}")
+
+    # 6. Upload do vídeo
+    video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    blob_url = upload_bytes_to_blob(video_bytes, f"videos/{video_id}.mp4", "video/mp4")
+
+    # 7. Registrar créditos (LoRA frame + minimax video como operação única)
+    total_credits += register_credit_usage(
+        db=db, user_id=current_user.id, channel_id=ch.id,
+        resource_type="video", resource_id=video_id,
+        operation_type="video_generation", model_name="minimax/video-01",
+        video_seconds=_VIDEO_WITH_CHARACTER_DURATION,
+        metadata={"frame_url": frame_url, "size": "720x1280", "lora_version": str(ch.lora_version)[:16]},
+    )
+
+    # 8. Persistir
+    v = VideoDB(
+        id=video_id, channel_id=ch.id, channel_name=ch.name,
+        prompt=lora_frame_prompt, caption=caption, video_path=blob_url,
+        duration_seconds=_VIDEO_WITH_CHARACTER_DURATION, size="720x1280",
         published=False, credits_consumed=total_credits,
     )
     db.add(v)
