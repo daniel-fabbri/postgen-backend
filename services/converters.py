@@ -22,6 +22,8 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
         image_model=ch.image_model or "mai",
         auto_reply_enabled=ch.auto_reply_enabled or False,
         auto_reply_prompt=ch.auto_reply_prompt,
+        lora_status=ch.lora_status,
+        lora_version=ch.lora_version,
     )
 
 
