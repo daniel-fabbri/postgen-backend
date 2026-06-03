@@ -23,6 +23,7 @@ from schemas import (
     VideoProjectOut, CreateVideoProjectRequest, UpdateVideoProjectClipsRequest,
     GenerateProjectClipRequest, AddVideoToProjectRequest,
 )
+from services.azure_ai import generate_image_bytes, identify_main_person_bbox, create_inpaint_mask
 from services.blob_storage import upload_bytes_to_blob
 from services.replicate_ai import generate_with_lora, generate_video_from_image
 from services.converters import video_to_schema, video_project_to_schema
@@ -226,12 +227,15 @@ def generate_video_with_character(
     db: Session = Depends(get_db),
 ):
     """
-    Gera vídeo com personagem do canal via LoRA + minimax/video-01.
+    Gera vídeo com personagem via GPT-Image-2 + LoRA inpainting + minimax/video-01.
     Requer LoRA treinado (ch.lora_status == "succeeded").
     Fluxo:
-      1. Gera frame portrait (9:16) via LoRA com trigger word TOK
-      2. Anima o frame com minimax/video-01
-      3. Gera legenda via GPT-4o
+      1. GPT-Image-2 gera cena rica com a pessoa (iluminação, background, composição)
+      2. OpenCV detecta o rosto na cena e cria máscara
+      3. LoRA inpainting substitui só o rosto pelo personagem do canal (TOK)
+         – se não houver rosto detectado, usa img2img na cena inteira (fallback)
+      4. minimax/video-01 anima a cena com o personagem
+      5. GPT-4o gera legenda
     """
     ch = get_channel_or_404(data.channel_id, current_user, db)
     s = get_or_create_settings(current_user, db)
@@ -244,44 +248,76 @@ def generate_video_with_character(
     if not REPLICATE_API_KEY:
         raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor.")
 
-    # 1. Prompt para o frame de referência (inclui trigger word TOK do LoRA)
-    base_prompt = ch.image_generation_prompt or f"portrait of TOK, {ch.objective}"
-    lora_frame_prompt = f"TOK, {base_prompt}"
-    if data.additional_prompt:
-        lora_frame_prompt += f", {data.additional_prompt}"
-    lora_frame_prompt = lora_frame_prompt[:2000]
+    frame_id = f"charframe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    base_prompt = ch.image_generation_prompt or f"Portrait photo of a person, {ch.objective}"
 
-    print(f"[VIDEO-WITH-CHARACTER] Step 1 – frame LoRA | channel={ch.id}")
+    # 1. GPT-Image-2: cena de alta qualidade com pessoa visível
+    scene_prompt = (
+        f"{base_prompt}, portrait photo, person facing camera, upper body visible"
+        + (f", {data.additional_prompt}" if data.additional_prompt else "")
+    )[:4000]
 
-    # 2. Gerar frame portrait via LoRA
+    print(f"[VIDEO-WITH-CHARACTER] Step 1 – GPT-Image-2 | prompt={scene_prompt[:80]}")
+    scene_bytes = generate_image_bytes(scene_prompt, ch, s, db)
+    scene_url = upload_bytes_to_blob(scene_bytes, f"temp/{frame_id}_scene.png", "image/png")
+    print(f"[VIDEO-WITH-CHARACTER] Cena gerada: {scene_url[:60]}")
+
+    total_credits = 0.0
+    total_credits += register_credit_usage(
+        db=db, user_id=current_user.id, channel_id=ch.id,
+        resource_type="video", resource_id=None,
+        operation_type="image_generation", model_name="gpt-image-2",
+        images_count=1, metadata={"step": "scene_generation"},
+    )
+
+    # 2. Detectar rosto na cena → máscara para inpainting cirúrgico
+    mask_url = None
+    bbox = identify_main_person_bbox(scene_url, ch.image_generation_prompt or "")
+    print(f"[VIDEO-WITH-CHARACTER] Step 2 – face detection: bbox={bbox}")
+    if bbox:
+        mask_bytes = create_inpaint_mask(bbox)
+        mask_url = upload_bytes_to_blob(mask_bytes, f"temp/{frame_id}_mask.png", "image/png")
+
+    # 3. LoRA inpainting (inpaint se rosto detectado, img2img como fallback)
+    lora_prompt = (
+        f"TOK, {base_prompt}"
+        + (f", {data.additional_prompt}" if data.additional_prompt else "")
+    )[:2000]
+
+    mode_log = "inpainting" if mask_url else "img2img (sem rosto detectado)"
+    print(f"[VIDEO-WITH-CHARACTER] Step 3 – LoRA {mode_log}")
     lora_image_bytes = generate_with_lora(
-        prompt=lora_frame_prompt,
+        prompt=lora_prompt,
         lora_ref=ch.lora_version,
         api_key=REPLICATE_API_KEY,
-        aspect_ratio="9:16",
+        base_image_url=scene_url,
+        mask_url=mask_url,
     )
-    frame_id = f"charframe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    frame_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}.png", "image/png")
-    print(f"[VIDEO-WITH-CHARACTER] Frame gerado: {frame_url[:60]}")
+    char_scene_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}_char.png", "image/png")
+    print(f"[VIDEO-WITH-CHARACTER] Cena com personagem: {char_scene_url[:60]}")
 
-    # 3. Prompt de movimento para o vídeo
-    motion_prompt = ch.image_generation_prompt or f"Cinematic motion, {ch.objective}."
-    if data.additional_prompt:
-        motion_prompt += f" {data.additional_prompt}"
-    motion_prompt = motion_prompt[:2000]
+    total_credits += register_credit_usage(
+        db=db, user_id=current_user.id, channel_id=ch.id,
+        resource_type="video", resource_id=None,
+        operation_type="image_generation", model_name="replicate/flux-lora",
+        images_count=1, metadata={"step": "lora_inpaint", "mode": mode_log},
+    )
 
-    print(f"[VIDEO-WITH-CHARACTER] Step 2 – minimax/video-01 | prompt={motion_prompt[:80]}")
+    # 4. MiniMax: animar a cena com o personagem
+    motion_prompt = (
+        f"{base_prompt}"
+        + (f", {data.additional_prompt}" if data.additional_prompt else "")
+    )[:2000]
 
-    # 4. Animar o frame
+    print(f"[VIDEO-WITH-CHARACTER] Step 4 – minimax/video-01 | prompt={motion_prompt[:80]}")
     video_bytes = generate_video_from_image(
-        image_url=frame_url,
+        image_url=char_scene_url,
         prompt=motion_prompt,
         api_key=REPLICATE_API_KEY,
     )
 
     # 5. Legenda via GPT-4o
     caption = ""
-    total_credits = 0.0
     try:
         client = get_azure_client(s)
         text_prompt = ch.text_generation_prompt or f"""Crie uma legenda para um Instagram Reel do canal "{ch.name}".
@@ -319,7 +355,7 @@ Retorne apenas o texto da legenda."""
         resource_type="video", resource_id=video_id,
         operation_type="video_generation", model_name="minimax/video-01",
         video_seconds=_VIDEO_WITH_CHARACTER_DURATION,
-        metadata={"frame_url": frame_url, "size": "720x1280", "lora_version": str(ch.lora_version)[:16]},
+        metadata={"scene_url": char_scene_url[:60], "size": "720x1280", "lora_version": str(ch.lora_version)[:16]},
     )
 
     # 8. Persistir
