@@ -630,6 +630,7 @@ def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
             "input": {
                 "face": video_url,
                 "audio": audio_url,
+                "pads": "0 0 0 0",
                 "smooth": True,
                 "resize_factor": 1,
             }

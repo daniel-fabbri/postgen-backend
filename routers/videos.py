@@ -26,7 +26,7 @@ from schemas import (
 )
 from services.azure_ai import generate_image_bytes, identify_main_person_bbox, create_inpaint_mask
 from services.blob_storage import upload_bytes_to_blob
-from services.replicate_ai import generate_with_lora, generate_video_from_image, generate_talking_head
+from services.replicate_ai import generate_with_lora, generate_video_from_image, generate_lipsync
 from services.converters import video_to_schema, video_project_to_schema
 from services.credits import register_credit_usage
 from services.instagram import ig_api_base
@@ -305,11 +305,11 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
                 video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
                 video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
                 try:
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker lipsync")
-                    video_bytes = generate_talking_head(video_tmp_url, audio_url, REPLICATE_API_KEY)
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker ok: {len(video_bytes)} bytes")
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – Wav2Lip lipsync")
+                    video_bytes = generate_lipsync(video_tmp_url, audio_url, REPLICATE_API_KEY)
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – Wav2Lip ok: {len(video_bytes)} bytes")
                 except Exception as e:
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker FALHOU ({e}), fallback ffmpeg mix")
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – Wav2Lip FALHOU ({e}), fallback ffmpeg mix")
                     try:
                         video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
                         print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix ok")
