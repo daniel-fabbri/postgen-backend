@@ -67,7 +67,7 @@ def get_reference_context(channel_id: str, db: Session) -> str:
 
 
 def _detect_faces_opencv(image_url: str) -> list:
-    """Baixa a imagem e detecta todas as faces com OpenCV Haar Cascade (local, sem API)."""
+    """Baixa a imagem e detecta faces com OpenCV Haar Cascade com filtros anti-falso-positivo."""
     import cv2
     import numpy as np
 
@@ -85,19 +85,31 @@ def _detect_faces_opencv(image_url: str) -> list:
     cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
-    # scaleFactor=1.05 + minNeighbors=3 para ser mais sensível a faces menores
+    # minNeighbors=6 é mais restritivo — elimina falsos positivos em janelas/padrões arquitetônicos
+    min_face_px = max(60, int(min(w, h) * 0.06))
     detections = cascade.detectMultiScale(
-        gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40)
+        gray, scaleFactor=1.05, minNeighbors=6, minSize=(min_face_px, min_face_px)
     )
 
     faces = []
     for (x, y, fw, fh) in (detections if len(detections) > 0 else []):
-        faces.append({
-            "x": float(x) / w,
-            "y": float(y) / h,
-            "w": float(fw) / w,
-            "h": float(fh) / h,
-        })
+        rx, ry = float(x) / w, float(y) / h
+        rw, rh = float(fw) / w, float(fh) / h
+
+        # Filtro 1: aspect ratio — rostos são ~quadrados (0.65–1.5); janelas podem ser muito retangulares
+        aspect = rw / rh if rh > 0 else 0
+        if not (0.65 <= aspect <= 1.5):
+            continue
+
+        # Filtro 2: posição vertical — rejeitar detecções muito no topo (y < 15% = background buildings)
+        # mas só se o centro vertical da detecção estiver acima de 25% da imagem
+        center_y = ry + rh / 2
+        if center_y < 0.20:
+            continue
+
+        faces.append({"x": rx, "y": ry, "w": rw, "h": rh})
+
+    print(f"[VISION] OpenCV detectou {len(faces)} face(s) após filtros (de {len(detections) if len(detections) > 0 else 0} raw)")
     return faces
 
 
