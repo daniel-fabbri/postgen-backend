@@ -253,27 +253,19 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             images_count=1, metadata={"step": "scene_generation"},
         )
 
-        # Step 2: Detectar rosto → máscara
-        mask_url = None
-        bbox = identify_main_person_bbox(scene_url, ch.image_generation_prompt or "")
-        print(f"[CHARACTER JOB {job_id}] Step 2 – face detection: bbox={'found' if bbox else 'none'}")
-        if bbox:
-            mask_bytes = create_inpaint_mask(bbox, image_w=img_w, image_h=img_h)
-            mask_url = upload_bytes_to_blob(mask_bytes, f"temp/{frame_id}_mask.png", "image/png")
-
-        # Step 3: LoRA inpainting (ou img2img se não detectou rosto)
+        # Step 2: LoRA img2img — aplica identidade do personagem na cena inteira (sem máscara)
+        # Inpainting com elipse criava seam visível; img2img preserva o background via prompt_strength
         lora_prompt = (
             f"TOK, {base_prompt}"
             + (f", {additional_prompt}" if additional_prompt else "")
         )[:2000]
-        mode_log = "inpainting" if mask_url else "img2img"
-        print(f"[CHARACTER JOB {job_id}] Step 3 – LoRA {mode_log}")
+        print(f"[CHARACTER JOB {job_id}] Step 2 – LoRA img2img")
         lora_image_bytes = generate_with_lora(
             prompt=lora_prompt,
             lora_ref=ch.lora_version,
             api_key=REPLICATE_API_KEY,
             base_image_url=scene_url,
-            mask_url=mask_url,
+            mask_url=None,
         )
         char_scene_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}_char.png", "image/png")
 
@@ -281,33 +273,44 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             db=db, user_id=user_id, channel_id=channel_id,
             resource_type="video", resource_id=None,
             operation_type="image_generation", model_name="replicate/flux-lora",
-            images_count=1, metadata={"step": "lora_inpaint", "mode": mode_log},
+            images_count=1, metadata={"step": "lora_img2img"},
         )
 
         # Step 4: MiniMax — animar a cena
         motion_prompt = (
             f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
         )[:2000]
-        print(f"[CHARACTER JOB {job_id}] Step 4 – minimax/video-01")
+        print(f"[CHARACTER JOB {job_id}] Step 3 – minimax/video-01")
         video_bytes = generate_video_from_image(
             image_url=char_scene_url,
             prompt=motion_prompt,
             api_key=REPLICATE_API_KEY,
         )
 
-        # Step 5: Áudio via ElevenLabs (opcional — só se canal tiver voz clonada e roteiro fornecido)
+        # Step 4: Voz clonada + LatentSync (lip sync real com a voz do usuário)
         from config import ELEVENLABS_API_KEY
         if ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY:
             try:
-                from services.elevenlabs import generate_tts, mix_audio_into_video
-                print(f"[CHARACTER JOB {job_id}] Step 5 – ElevenLabs TTS + ffmpeg mix")
+                from services.elevenlabs import generate_tts
+                from services.replicate_ai import generate_lipsync
+                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS")
                 tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
-                video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
-                print(f"[CHARACTER JOB {job_id}] Step 5 – áudio mixado com sucesso")
-            except Exception as e:
-                print(f"[CHARACTER JOB {job_id}] TTS/audio falhou (não-fatal): {e}")
 
-        # Step 6: Legenda
+                # Faz upload do áudio para blob antes de passar ao LatentSync (precisa de URL pública)
+                audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
+
+                # Upload do vídeo MiniMax para blob (LatentSync precisa de URL pública)
+                video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
+
+                print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync lip sync")
+                video_bytes = generate_lipsync(video_tmp_url, audio_url, REPLICATE_API_KEY)
+                print(f"[CHARACTER JOB {job_id}] Step 4 – lipsync concluído")
+            except Exception as e:
+                print(f"[CHARACTER JOB {job_id}] TTS/lipsync falhou (não-fatal): {e}")
+
+        # Step 5: Legenda
         caption = ""
         try:
             client = get_azure_client(s)

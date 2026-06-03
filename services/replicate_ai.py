@@ -529,3 +529,68 @@ def _download_output(prediction: dict) -> bytes:
     resp.raise_for_status()
     print(f"[REPLICATE] ✓ Imagem baixada: {len(resp.content)} bytes")
     return resp.content
+
+
+def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
+    """
+    Aplica lipsync no vídeo usando bytedance/latentsync no Replicate.
+    video_url: URL pública do vídeo MP4 gerado pelo MiniMax.
+    audio_url: URL pública do áudio MP3 com a voz clonada.
+    Retorna bytes do vídeo MP4 com lipsync + áudio embutido.
+    """
+    if not api_key:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado")
+
+    print(f"[REPLICATE] latentsync | video={video_url[:60]} | audio={audio_url[:60]}")
+
+    create_resp = requests.post(
+        f"{_REPLICATE_API}/models/bytedance/latentsync/predictions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "input": {
+                "video": video_url,
+                "audio": audio_url,
+                "guidance_scale": 1.5,
+                "inference_steps": 20,
+            }
+        },
+        timeout=30,
+    )
+
+    if not create_resp.ok:
+        raise HTTPException(
+            status_code=create_resp.status_code,
+            detail=f"Replicate latentsync error: {create_resp.text[:400]}",
+        )
+
+    prediction = create_resp.json()
+    status = prediction.get("status")
+    prediction_id = prediction.get("id")
+    print(f"[REPLICATE] latentsync prediction {prediction_id} status={status}")
+
+    if status == "succeeded":
+        return _download_video_output(prediction)
+    if status in ("failed", "canceled"):
+        raise HTTPException(status_code=500, detail=f"latentsync falhou: {prediction.get('error')}")
+
+    for attempt in range(200):  # 200 × 3s = 10 minutos
+        time.sleep(_POLL_INTERVAL)
+        poll = requests.get(
+            f"{_REPLICATE_API}/predictions/{prediction_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if not poll.ok:
+            continue
+        result = poll.json()
+        status = result.get("status")
+        print(f"[REPLICATE] latentsync poll {attempt+1}/200 status={status}")
+        if status == "succeeded":
+            return _download_video_output(result)
+        if status in ("failed", "canceled"):
+            raise HTTPException(status_code=500, detail=f"latentsync falhou: {result.get('error')}")
+
+    raise HTTPException(status_code=504, detail="latentsync não concluiu em 10 minutos")
