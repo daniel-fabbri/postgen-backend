@@ -287,28 +287,37 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             api_key=REPLICATE_API_KEY,
         )
 
-        # Step 4: Voz clonada + LatentSync (lip sync real com a voz do usuário)
+        # Step 4: Voz clonada + LatentSync (com fallback para ffmpeg mix simples)
         from config import ELEVENLABS_API_KEY
+        print(f"[CHARACTER JOB {job_id}] Step 4 – voice_id={ch.elevenlabs_voice_id!r} script_len={len(voice_script)} key_ok={bool(ELEVENLABS_API_KEY)}")
         if ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY:
+            tts_bytes = None
             try:
                 from services.elevenlabs import generate_tts
-                from services.replicate_ai import generate_lipsync
-                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS ({len(voice_script)} chars)")
                 tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
-
-                # Faz upload do áudio para blob antes de passar ao LatentSync (precisa de URL pública)
-                audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
-
-                # Upload do vídeo MiniMax para blob (LatentSync precisa de URL pública)
-                video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
-
-                print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync lip sync")
-                video_bytes = generate_lipsync(video_tmp_url, audio_url, REPLICATE_API_KEY)
-                print(f"[CHARACTER JOB {job_id}] Step 4 – lipsync concluído")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS ok: {len(tts_bytes)} bytes")
             except Exception as e:
-                print(f"[CHARACTER JOB {job_id}] TTS/lipsync falhou (não-fatal): {e}")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS FALHOU: {e}")
+
+            if tts_bytes:
+                try:
+                    from services.replicate_ai import generate_lipsync
+                    audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                    audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
+                    video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                    video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync | video={video_tmp_url[:60]}")
+                    video_bytes = generate_lipsync(video_tmp_url, audio_url, REPLICATE_API_KEY)
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync ok: {len(video_bytes)} bytes")
+                except Exception as e:
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync FALHOU ({e}), fallback ffmpeg mix")
+                    try:
+                        from services.elevenlabs import mix_audio_into_video
+                        video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix ok")
+                    except Exception as e2:
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix FALHOU: {e2}")
 
         # Step 5: Legenda
         caption = ""
