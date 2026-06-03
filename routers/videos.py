@@ -276,43 +276,50 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             images_count=1, metadata={"step": "lora_img2img"},
         )
 
+        # Step 3: MiniMax — anima a cena (corpo se move) em todos os casos
+        motion_prompt = (
+            f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
+        )[:2000]
+        print(f"[CHARACTER JOB {job_id}] Step 3 – minimax/video-01")
+        video_bytes = generate_video_from_image(
+            image_url=char_scene_url,
+            prompt=motion_prompt,
+            api_key=REPLICATE_API_KEY,
+        )
+
+        # Step 4: SadTalker sobre o vídeo MiniMax (lipsync preservando movimento do corpo)
         from config import ELEVENLABS_API_KEY
         has_voice = bool(ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY)
 
         if has_voice:
-            # Step 3: TTS → SadTalker (imagem estática → talking head com lip sync)
-            # Pula MiniMax — SadTalker gera o vídeo e o lip sync em um único passo
-            print(f"[CHARACTER JOB {job_id}] Step 3 – ElevenLabs TTS ({len(voice_script)} chars)")
             from services.elevenlabs import generate_tts, mix_audio_into_video
-            tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
-            print(f"[CHARACTER JOB {job_id}] Step 3 – TTS ok: {len(tts_bytes)} bytes")
-
-            audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
-
-            print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker talking head")
+            tts_bytes = None
+            audio_url = None
             try:
-                video_bytes = generate_talking_head(char_scene_url, audio_url, REPLICATE_API_KEY)
-                print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker ok: {len(video_bytes)} bytes")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS ({len(voice_script)} chars)")
+                tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
+                audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS ok: {len(tts_bytes)} bytes")
             except Exception as e:
-                print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker FALHOU ({e}), fallback MiniMax+ffmpeg")
-                motion_prompt = (f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else ""))[:2000]
-                video_bytes = generate_video_from_image(image_url=char_scene_url, prompt=motion_prompt, api_key=REPLICATE_API_KEY)
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS FALHOU: {e}")
+
+            if audio_url:
+                # Faz upload do vídeo MiniMax para o SadTalker usar como source_image
+                video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
+
                 try:
-                    video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
-                except Exception as e2:
-                    print(f"[CHARACTER JOB {job_id}] ffmpeg fallback FALHOU: {e2}")
-        else:
-            # Step 3: MiniMax — animação ambiente sem voz
-            motion_prompt = (
-                f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
-            )[:2000]
-            print(f"[CHARACTER JOB {job_id}] Step 3 – minimax/video-01")
-            video_bytes = generate_video_from_image(
-                image_url=char_scene_url,
-                prompt=motion_prompt,
-                api_key=REPLICATE_API_KEY,
-            )
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker sobre vídeo MiniMax")
+                    video_bytes = generate_talking_head(video_tmp_url, audio_url, REPLICATE_API_KEY)
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker ok: {len(video_bytes)} bytes")
+                except Exception as e:
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker FALHOU ({e}), fallback ffmpeg mix")
+                    try:
+                        video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix ok")
+                    except Exception as e2:
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix FALHOU: {e2}")
 
         # Step 5: Legenda
         caption = ""
