@@ -531,6 +531,79 @@ def _download_output(prediction: dict) -> bytes:
     return resp.content
 
 
+_SADTALKER_VERSION = "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3"
+
+
+def generate_talking_head(image_url: str, audio_url: str, api_key: str) -> bytes:
+    """
+    Gera vídeo talking head a partir de imagem estática + áudio usando SadTalker.
+    image_url: URL pública da imagem PNG com o rosto (saída do LoRA).
+    audio_url: URL pública do áudio MP3 com a voz clonada (ElevenLabs).
+    Retorna bytes do vídeo MP4 com lip sync + áudio embutido.
+    """
+    if not api_key:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado")
+
+    print(f"[REPLICATE] sadtalker | image={image_url[:60]} | audio={audio_url[:60]}")
+
+    create_resp = requests.post(
+        f"{_REPLICATE_API}/predictions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "version": _SADTALKER_VERSION,
+            "input": {
+                "source_image": image_url,
+                "driven_audio": audio_url,
+                "preprocess": "full",
+                "still_mode": True,
+                "use_enhancer": True,
+                "use_eyeblink": True,
+                "size_of_image": 512,
+                "expression_scale": 1.0,
+            }
+        },
+        timeout=30,
+    )
+
+    if not create_resp.ok:
+        raise HTTPException(
+            status_code=create_resp.status_code,
+            detail=f"Replicate SadTalker error: {create_resp.text[:400]}",
+        )
+
+    prediction = create_resp.json()
+    status = prediction.get("status")
+    prediction_id = prediction.get("id")
+    print(f"[REPLICATE] sadtalker prediction {prediction_id} status={status}")
+
+    if status == "succeeded":
+        return _download_video_output(prediction)
+    if status in ("failed", "canceled"):
+        raise HTTPException(status_code=500, detail=f"SadTalker falhou: {prediction.get('error')}")
+
+    for attempt in range(200):  # 200 × 3s = 10 minutos
+        time.sleep(_POLL_INTERVAL)
+        poll = requests.get(
+            f"{_REPLICATE_API}/predictions/{prediction_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if not poll.ok:
+            continue
+        result = poll.json()
+        status = result.get("status")
+        print(f"[REPLICATE] sadtalker poll {attempt+1}/200 status={status}")
+        if status == "succeeded":
+            return _download_video_output(result)
+        if status in ("failed", "canceled"):
+            raise HTTPException(status_code=500, detail=f"SadTalker falhou: {result.get('error')}")
+
+    raise HTTPException(status_code=504, detail="SadTalker não concluiu em 10 minutos")
+
+
 _WAV2LIP_VERSION = "8d65e3f4f4298520e079198b493c25adfc43c058ffec924f2aefc8010ed25eef"
 
 

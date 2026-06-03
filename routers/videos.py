@@ -26,7 +26,7 @@ from schemas import (
 )
 from services.azure_ai import generate_image_bytes, identify_main_person_bbox, create_inpaint_mask
 from services.blob_storage import upload_bytes_to_blob
-from services.replicate_ai import generate_with_lora, generate_video_from_image
+from services.replicate_ai import generate_with_lora, generate_video_from_image, generate_talking_head
 from services.converters import video_to_schema, video_project_to_schema
 from services.credits import register_credit_usage
 from services.instagram import ig_api_base
@@ -276,56 +276,52 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             images_count=1, metadata={"step": "lora_img2img"},
         )
 
-        # Step 4: MiniMax — animar a cena
-        motion_prompt = (
-            f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
-        )[:2000]
-        print(f"[CHARACTER JOB {job_id}] Step 3 – minimax/video-01")
-        video_bytes = generate_video_from_image(
-            image_url=char_scene_url,
-            prompt=motion_prompt,
-            api_key=REPLICATE_API_KEY,
-        )
-
-        # Step 4: Voz clonada + LatentSync (com fallback para ffmpeg mix simples)
         from config import ELEVENLABS_API_KEY
-        print(f"[CHARACTER JOB {job_id}] Step 4 – voice_id={ch.elevenlabs_voice_id!r} script_len={len(voice_script)} key_ok={bool(ELEVENLABS_API_KEY)}")
-        if ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY:
-            tts_bytes = None
-            try:
-                from services.elevenlabs import generate_tts
-                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS ({len(voice_script)} chars)")
-                tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
-                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS ok: {len(tts_bytes)} bytes")
-            except Exception as e:
-                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS FALHOU: {e}")
+        has_voice = bool(ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY)
 
-            if tts_bytes:
+        if has_voice:
+            # Step 3: TTS → SadTalker (imagem estática → talking head com lip sync)
+            # Pula MiniMax — SadTalker gera o vídeo e o lip sync em um único passo
+            print(f"[CHARACTER JOB {job_id}] Step 3 – ElevenLabs TTS ({len(voice_script)} chars)")
+            from services.elevenlabs import generate_tts, mix_audio_into_video
+            tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
+            print(f"[CHARACTER JOB {job_id}] Step 3 – TTS ok: {len(tts_bytes)} bytes")
+
+            audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
+
+            print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker talking head")
+            try:
+                video_bytes = generate_talking_head(char_scene_url, audio_url, REPLICATE_API_KEY)
+                print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker ok: {len(video_bytes)} bytes")
+            except Exception as e:
+                print(f"[CHARACTER JOB {job_id}] Step 4 – SadTalker FALHOU ({e}), fallback MiniMax+ffmpeg")
+                motion_prompt = (f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else ""))[:2000]
+                video_bytes = generate_video_from_image(image_url=char_scene_url, prompt=motion_prompt, api_key=REPLICATE_API_KEY)
                 try:
-                    from services.replicate_ai import generate_lipsync
-                    audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                    audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
-                    video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-                    video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync | video={video_tmp_url[:60]}")
-                    video_bytes = generate_lipsync(video_tmp_url, audio_url, REPLICATE_API_KEY)
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync ok: {len(video_bytes)} bytes")
-                except Exception as e:
-                    print(f"[CHARACTER JOB {job_id}] Step 4b – LatentSync FALHOU ({e}), fallback ffmpeg mix")
-                    try:
-                        from services.elevenlabs import mix_audio_into_video
-                        video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
-                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix ok")
-                    except Exception as e2:
-                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix FALHOU: {e2}")
+                    video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
+                except Exception as e2:
+                    print(f"[CHARACTER JOB {job_id}] ffmpeg fallback FALHOU: {e2}")
+        else:
+            # Step 3: MiniMax — animação ambiente sem voz
+            motion_prompt = (
+                f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
+            )[:2000]
+            print(f"[CHARACTER JOB {job_id}] Step 3 – minimax/video-01")
+            video_bytes = generate_video_from_image(
+                image_url=char_scene_url,
+                prompt=motion_prompt,
+                api_key=REPLICATE_API_KEY,
+            )
 
         # Step 5: Legenda
         caption = ""
         try:
             client = get_azure_client(s)
+            conceito = additional_prompt or voice_script or base_prompt
             text_prompt = ch.text_generation_prompt or (
                 f'Crie uma legenda para um Instagram Reel do canal "{ch.name}".\n'
-                f"Objetivo: {ch.objective}\nConceito: {additional_prompt or motion_prompt}\n"
+                f"Objetivo: {ch.objective}\nConceito: {conceito}\n"
                 "Escreva uma legenda envolvente com emojis e hashtags, 80-150 palavras. Retorne só o texto."
             )
             cap_resp = client.chat.completions.create(
