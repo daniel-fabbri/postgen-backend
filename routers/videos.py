@@ -258,7 +258,7 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
         bbox = identify_main_person_bbox(scene_url, ch.image_generation_prompt or "")
         print(f"[CHARACTER JOB {job_id}] Step 2 – face detection: bbox={'found' if bbox else 'none'}")
         if bbox:
-            mask_bytes = create_inpaint_mask(bbox)
+            mask_bytes = create_inpaint_mask(bbox, image_w=img_w, image_h=img_h)
             mask_url = upload_bytes_to_blob(mask_bytes, f"temp/{frame_id}_mask.png", "image/png")
 
         # Step 3: LoRA inpainting (ou img2img se não detectou rosto)

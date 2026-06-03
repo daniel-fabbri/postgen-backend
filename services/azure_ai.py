@@ -139,41 +139,40 @@ def identify_main_person_bbox(image_url: str, person_description: str = "") -> O
         return None
 
 
-def create_inpaint_mask(bbox: dict, image_size: int = 1024) -> bytes:
+def create_inpaint_mask(bbox: dict, image_w: int = 1024, image_h: int = 1024) -> bytes:
     """
-    Cria uma máscara PNG para inpainting: branco onde o rosto está (região a alterar),
-    preto no resto (preservar cena, texto, outras pessoas).
-    A elipse é centrada no centro do rosto detectado, não deslocada pelo clipping das bordas.
+    Cria uma máscara PNG para inpainting: branco onde a cabeça está (região a alterar),
+    preto no resto (preservar cena).
+    A região cobre a cabeça completa incluindo cabelo, com bordas suavizadas.
     """
     from PIL import Image, ImageDraw, ImageFilter
 
-    x = int(bbox["x"] * image_size)
-    y = int(bbox["y"] * image_size)
-    w = int(bbox["w"] * image_size)
-    h = int(bbox["h"] * image_size)
+    x = int(bbox["x"] * image_w)
+    y = int(bbox["y"] * image_h)
+    w = int(bbox["w"] * image_w)
+    h = int(bbox["h"] * image_h)
 
-    # Centro do rosto detectado, deslocado levemente para cima (inclui testa/cabelo)
+    # Centro deslocado para cima para incluir o cabelo (25% da altura do bbox acima do centro)
     cx = x + w // 2
-    cy = y + h // 2 - int(h * 0.05)
+    cy = y + h // 2 - int(h * 0.25)
 
-    # Semi-eixos: 60% da largura e 65% da altura do bbox
-    # → elipse ~20% mais larga e ~30% mais alta que o rosto detectado
-    # Antes era ~75% e ~85% (muito invasivo com rostos vizinhos)
-    rx = int(w * 0.60)
-    ry = int(h * 0.65)
+    # Semi-eixos generosos: cobre a cabeça inteira incluindo cabelo e orelhas
+    # rx = 90% da largura do bbox (face + orelhas), ry = 110% (inclui cabelo acima + pescoço abaixo)
+    rx = int(w * 0.90)
+    ry = int(h * 1.10)
 
-    # Bounding box da elipse centrada no rosto — clipping simétrico nas bordas
     x1 = max(0, cx - rx)
     y1 = max(0, cy - ry)
-    x2 = min(image_size, cx + rx)
-    y2 = min(image_size, cy + ry)
+    x2 = min(image_w, cx + rx)
+    y2 = min(image_h, cy + ry)
 
-    mask = Image.new("L", (image_size, image_size), 0)
+    mask = Image.new("L", (image_w, image_h), 0)
     draw = ImageDraw.Draw(mask)
     draw.ellipse([x1, y1, x2, y2], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=10))
+    # Blur generoso para borda suave e sem artefato de círculo visível
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=28))
 
-    mask_rgb = Image.new("RGB", (image_size, image_size), (0, 0, 0))
+    mask_rgb = Image.new("RGB", (image_w, image_h), (0, 0, 0))
     mask_rgb.paste((255, 255, 255), mask=mask)
 
     buf = io.BytesIO()
