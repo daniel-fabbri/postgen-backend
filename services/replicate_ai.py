@@ -558,11 +558,11 @@ def generate_talking_head(image_url: str, audio_url: str, api_key: str) -> bytes
                 "source_image": image_url,
                 "driven_audio": audio_url,
                 "preprocess": "full",
-                "still_mode": False,
+                "still_mode": True,
                 "use_enhancer": True,
                 "use_eyeblink": True,
                 "size_of_image": 512,
-                "expression_scale": 2.0,
+                "expression_scale": 1.5,
             }
         },
         timeout=30,

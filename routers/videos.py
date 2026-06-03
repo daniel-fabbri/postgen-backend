@@ -287,18 +287,34 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             api_key=REPLICATE_API_KEY,
         )
 
-        # Step 4: Áudio via ElevenLabs + ffmpeg mix (sem lipsync — preserva qualidade do MiniMax)
+        # Step 4: Áudio (TTS) + SadTalker sobre o vídeo MiniMax — lipsync com still_mode=True
         from config import ELEVENLABS_API_KEY
         if ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY:
             from services.elevenlabs import generate_tts, mix_audio_into_video
+            tts_bytes = None
             try:
-                print(f"[CHARACTER JOB {job_id}] Step 4 – ElevenLabs TTS ({len(voice_script)} chars)")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – ElevenLabs TTS ({len(voice_script)} chars)")
                 tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
-                print(f"[CHARACTER JOB {job_id}] Step 4 – TTS ok: {len(tts_bytes)} bytes, mixando com ffmpeg")
-                video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
-                print(f"[CHARACTER JOB {job_id}] Step 4 – ffmpeg mix ok")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS ok: {len(tts_bytes)} bytes")
             except Exception as e:
-                print(f"[CHARACTER JOB {job_id}] Step 4 – áudio FALHOU (não-fatal): {e}")
+                print(f"[CHARACTER JOB {job_id}] Step 4a – TTS FALHOU: {e}")
+
+            if tts_bytes:
+                audio_id = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                audio_url = upload_bytes_to_blob(tts_bytes, f"temp/{audio_id}.mp3", "audio/mpeg")
+                video_tmp_id = f"video_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                video_tmp_url = upload_bytes_to_blob(video_bytes, f"temp/{video_tmp_id}.mp4", "video/mp4")
+                try:
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker lipsync")
+                    video_bytes = generate_talking_head(video_tmp_url, audio_url, REPLICATE_API_KEY)
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker ok: {len(video_bytes)} bytes")
+                except Exception as e:
+                    print(f"[CHARACTER JOB {job_id}] Step 4b – SadTalker FALHOU ({e}), fallback ffmpeg mix")
+                    try:
+                        video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg mix ok")
+                    except Exception as e2:
+                        print(f"[CHARACTER JOB {job_id}] Step 4b – ffmpeg FALHOU: {e2}")
 
         # Step 5: Legenda
         caption = ""
