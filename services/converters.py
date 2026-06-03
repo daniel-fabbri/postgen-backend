@@ -24,6 +24,7 @@ def channel_to_schema(ch: ChannelDB) -> Channel:
         auto_reply_prompt=ch.auto_reply_prompt,
         lora_status=ch.lora_status,
         lora_version=ch.lora_version,
+        elevenlabs_voice_id=ch.elevenlabs_voice_id,
     )
 
 

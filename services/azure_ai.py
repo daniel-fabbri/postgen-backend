@@ -45,7 +45,7 @@ def generate_image_bytes(
         model="gpt-image-2",
         prompt=prompt,
         n=1,
-        size="1024x1024",
+        size=f"{width}x{height}",
     )
     img_bytes = base64.b64decode(result.data[0].b64_json)
     print(f"[GEN_IMAGE] ✓ {len(img_bytes)} bytes")

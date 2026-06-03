@@ -370,31 +370,65 @@ def face_apply_post_image(
     refs = db.query(ReferenceImageDB).filter(
         ReferenceImageDB.channel_id == ch.id,
     ).order_by(ReferenceImageDB.created_at.desc()).limit(1).all()
-    if not refs:
-        raise HTTPException(status_code=400, detail="Canal sem imagens de referência. Adicione fotos do rosto na aba Referências.")
-
-    target_url = p.image_path if p.image_path.startswith("http") else None
-    if not target_url:
-        raise HTTPException(status_code=400, detail="URL da imagem do post não é pública")
-
-    print(f"[FACE_APPLY] post={post_id} target={target_url[:60]} swap={refs[0].blob_url[:60]}")
-
-    from services.replicate_ai import apply_face_swap
-    img_bytes = apply_face_swap(
-        target_image_url=target_url,
-        swap_image_url=refs[0].blob_url,
-        api_key=REPLICATE_API_KEY,
-    )
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}_face.png", "image/png")
-    p.image_path = blob_url
-    register_credit_usage(
-        db=db, user_id=current_user.id, channel_id=ch.id,
-        resource_type="post", resource_id=post_id,
-        operation_type="face_apply", model_name="replicate/faceswap",
-        images_count=1, metadata={"type": "face_swap"},
-    )
+
+    if ch.lora_version and ch.lora_status == "succeeded":
+        # LoRA inpainting: identifica o Daniel na imagem → máscara → LoRA só no rosto dele
+        image_prompt = p.prompt or data.prompt or ""
+        lora_prompt = f"TOK, {image_prompt}" if image_prompt else "TOK"
+        base_url = p.image_path if p.image_path and p.image_path.startswith("http") else None
+
+        from services.replicate_ai import generate_with_lora
+        from services.azure_ai import identify_main_person_bbox, create_inpaint_mask
+
+        mask_url = None
+        person_description = ch.image_generation_prompt or ""
+        if base_url and person_description:
+            bbox = identify_main_person_bbox(base_url, person_description)
+            if bbox:
+                mask_bytes = create_inpaint_mask(bbox)
+                mask_url = upload_bytes_to_blob(
+                    mask_bytes, f"posts/mask_{post_id}_{ts}.png", "image/png"
+                )
+
+        mode = "inpainting" if mask_url else "img2img"
+        print(f"[FACE_APPLY] LoRA {mode} | canal={ch.id} | mask={'sim' if mask_url else 'não'}")
+        img_bytes = generate_with_lora(
+            lora_prompt, ch.lora_version, REPLICATE_API_KEY,
+            base_image_url=base_url, mask_url=mask_url,
+        )
+        blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}_face.png", "image/png")
+        p.image_path = blob_url
+        register_credit_usage(
+            db=db, user_id=current_user.id, channel_id=ch.id,
+            resource_type="post", resource_id=post_id,
+            operation_type="image_generation", model_name="replicate/flux-lora",
+            images_count=1, metadata={"type": "lora_generate"},
+        )
+    else:
+        # Fallback: face-swap clássico
+        target_url = p.image_path if p.image_path.startswith("http") else None
+        if not target_url:
+            raise HTTPException(status_code=400, detail="URL da imagem do post não é pública")
+        if not refs:
+            raise HTTPException(status_code=400, detail="Canal sem imagens de referência.")
+        print(f"[FACE_APPLY] swap mode | post={post_id} target={target_url[:60]} swap={refs[0].blob_url[:60]}")
+        from services.replicate_ai import apply_face_swap
+        img_bytes = apply_face_swap(
+            target_image_url=target_url,
+            swap_image_url=refs[0].blob_url,
+            api_key=REPLICATE_API_KEY,
+        )
+        blob_url = upload_bytes_to_blob(img_bytes, f"posts/{post_id}_{ts}_face.png", "image/png")
+        p.image_path = blob_url
+        register_credit_usage(
+            db=db, user_id=current_user.id, channel_id=ch.id,
+            resource_type="post", resource_id=post_id,
+            operation_type="face_apply", model_name="replicate/faceswap",
+            images_count=1, metadata={"type": "face_swap"},
+        )
+
     db.commit()
     print(f"[FACE_APPLY] ✓ Concluído: {blob_url[:60]}")
     return {"success": True, "image_url": blob_url, "image_path": blob_url}

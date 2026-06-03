@@ -1,3 +1,5 @@
+import io
+import zipfile
 import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
@@ -546,3 +548,152 @@ def delete_reference_image(
         raise HTTPException(status_code=404, detail="Imagem de referência não encontrada")
     db.delete(ref)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Voz (ElevenLabs)
+# ---------------------------------------------------------------------------
+
+@router.post("/api/channels/{channel_id}/voice-clone", response_model=Channel)
+def create_voice_clone_endpoint(
+    channel_id: str,
+    file: UploadFile = File(...),
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cria clone de voz no ElevenLabs a partir de amostra de áudio e salva o voice_id no canal."""
+    from config import ELEVENLABS_API_KEY
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=400, detail="ELEVENLABS_API_KEY não configurado no servidor")
+
+    ch = get_channel_or_404(channel_id, current_user, db)
+
+    audio_data = file.file.read()
+    from services.elevenlabs import create_voice_clone
+    voice_id = create_voice_clone(
+        name=f"postgen-{ch.name[:30]}",
+        audio_data=audio_data,
+        filename=file.filename or "voice.mp3",
+        api_key=ELEVENLABS_API_KEY,
+    )
+    ch.elevenlabs_voice_id = voice_id
+    db.commit()
+    db.refresh(ch)
+    return channel_to_schema(ch)
+
+
+@router.delete("/api/channels/{channel_id}/voice-clone", response_model=Channel)
+def delete_voice_clone_endpoint(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove o clone de voz do canal (não deleta do ElevenLabs)."""
+    ch = get_channel_or_404(channel_id, current_user, db)
+    ch.elevenlabs_voice_id = None
+    db.commit()
+    db.refresh(ch)
+    return channel_to_schema(ch)
+
+
+# ---------------------------------------------------------------------------
+# LoRA Training
+# ---------------------------------------------------------------------------
+
+@router.post("/api/channels/{channel_id}/lora/train")
+def start_lora_training(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Inicia o fine-tuning de LoRA com as imagens de referência do canal."""
+    if not REPLICATE_API_KEY:
+        raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado")
+
+    ch = get_channel_or_404(channel_id, current_user, db)
+
+    refs = db.query(ReferenceImageDB).filter(
+        ReferenceImageDB.channel_id == channel_id,
+    ).order_by(ReferenceImageDB.created_at.desc()).all()
+
+    if len(refs) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"São necessárias pelo menos 5 fotos de referência para treinar. Você tem {len(refs)}.",
+        )
+
+    # Baixa as imagens de referência e cria um ZIP
+    buffer = io.BytesIO()
+    downloaded = 0
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, ref in enumerate(refs):
+            try:
+                resp = requests.get(ref.blob_url, timeout=30)
+                resp.raise_for_status()
+                ext = ref.blob_url.split(".")[-1].split("?")[0].lower()
+                if ext not in ("jpg", "jpeg", "png", "webp"):
+                    ext = "jpg"
+                zf.writestr(f"image_{i+1:03d}.{ext}", resp.content)
+                downloaded += 1
+            except Exception as e:
+                print(f"[LORA] Aviso: falha ao baixar ref {ref.id}: {e}")
+
+    if downloaded < 5:
+        raise HTTPException(status_code=500, detail="Não foi possível baixar imagens suficientes para treinar.")
+
+    buffer.seek(0)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_blob_name = f"lora_training/{channel_id}_{ts}.zip"
+    zip_url = upload_bytes_to_blob(buffer.read(), zip_blob_name, "application/zip")
+
+    from services.replicate_ai import start_lora_training as _start_training
+    training_id = _start_training(channel_id, zip_url, REPLICATE_API_KEY)
+
+    ch.lora_training_id = training_id
+    ch.lora_status = "training"
+    ch.lora_version = None
+    db.commit()
+
+    print(f"[LORA] Canal {channel_id} treinamento iniciado: {training_id}")
+    return {"success": True, "training_id": training_id, "status": "training"}
+
+
+@router.get("/api/channels/{channel_id}/lora/status")
+def get_lora_status(
+    channel_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Consulta e atualiza o status do treinamento LoRA do canal."""
+    ch = get_channel_or_404(channel_id, current_user, db)
+
+    if not ch.lora_training_id:
+        return {"status": None, "lora_version": None}
+
+    if ch.lora_status in ("succeeded", "failed", "canceled"):
+        return {"status": ch.lora_status, "lora_version": ch.lora_version}
+
+    # Status ainda em andamento — consulta o Replicate
+    from services.replicate_ai import get_lora_training_status, _sanitize_model_name, _REPLICATE_ACCOUNT
+    result = get_lora_training_status(ch.lora_training_id, REPLICATE_API_KEY)
+    status = result["status"]
+
+    if status == "succeeded":
+        # Busca o version ID real do modelo treinado (não apenas o model path)
+        model_name = _sanitize_model_name(channel_id)
+        mr = requests.get(
+            f"https://api.replicate.com/v1/models/{_REPLICATE_ACCOUNT}/{model_name}",
+            headers={"Authorization": f"Bearer {REPLICATE_API_KEY}"},
+            timeout=15,
+        )
+        version_id = None
+        if mr.ok:
+            version_id = mr.json().get("latest_version", {}).get("id")
+        ch.lora_status = "succeeded"
+        ch.lora_version = version_id or f"{_REPLICATE_ACCOUNT}/{model_name}"
+        db.commit()
+    elif status in ("failed", "canceled"):
+        ch.lora_status = status
+        db.commit()
+
+    return {"status": ch.lora_status, "lora_version": ch.lora_version, "error": result.get("error")}

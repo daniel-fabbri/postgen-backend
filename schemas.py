@@ -65,6 +65,7 @@ class Channel(BaseModel):
     auto_reply_prompt: Optional[str] = None
     lora_status: Optional[str] = None
     lora_version: Optional[str] = None
+    elevenlabs_voice_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -162,6 +163,7 @@ class GenerateVideoRequest(BaseModel):
     additional_prompt: Optional[str] = None
     seconds: int = 4
     size: str = "720x1280"
+    voice_script: Optional[str] = None
 
 
 class SavedVideo(BaseModel):

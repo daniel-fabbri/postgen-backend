@@ -221,7 +221,7 @@ Retorne apenas o texto da legenda."""
 _VIDEO_WITH_CHARACTER_DURATION = 6  # minimax/video-01 gera ~6s fixos
 
 
-def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additional_prompt: str):
+def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additional_prompt: str, image_size: str = "1024x1792", voice_script: str = ""):
     """
     Roda o pipeline GPT-Image-2 → LoRA inpainting → MiniMax em background thread.
     Usa sua própria sessão de DB — não reutiliza a sessão do request (não é thread-safe).
@@ -242,7 +242,8 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             + (f", {additional_prompt}" if additional_prompt else "")
         )[:4000]
         print(f"[CHARACTER JOB {job_id}] Step 1 – GPT-Image-2 | {scene_prompt[:60]}")
-        scene_bytes = generate_image_bytes(scene_prompt, ch, s, db)
+        img_w, img_h = (int(x) for x in image_size.split("x"))
+        scene_bytes = generate_image_bytes(scene_prompt, ch, s, db, width=img_w, height=img_h)
         scene_url = upload_bytes_to_blob(scene_bytes, f"temp/{frame_id}_scene.png", "image/png")
 
         total_credits = register_credit_usage(
@@ -294,7 +295,19 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             api_key=REPLICATE_API_KEY,
         )
 
-        # Step 5: Legenda
+        # Step 5: Áudio via ElevenLabs (opcional — só se canal tiver voz clonada e roteiro fornecido)
+        from config import ELEVENLABS_API_KEY
+        if ch.elevenlabs_voice_id and voice_script and ELEVENLABS_API_KEY:
+            try:
+                from services.elevenlabs import generate_tts, mix_audio_into_video
+                print(f"[CHARACTER JOB {job_id}] Step 5 – ElevenLabs TTS + ffmpeg mix")
+                tts_bytes = generate_tts(voice_script, ch.elevenlabs_voice_id, ELEVENLABS_API_KEY)
+                video_bytes = mix_audio_into_video(video_bytes, tts_bytes)
+                print(f"[CHARACTER JOB {job_id}] Step 5 – áudio mixado com sucesso")
+            except Exception as e:
+                print(f"[CHARACTER JOB {job_id}] TTS/audio falhou (não-fatal): {e}")
+
+        # Step 6: Legenda
         caption = ""
         try:
             client = get_azure_client(s)
@@ -332,13 +345,13 @@ def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additio
             resource_type="video", resource_id=video_id,
             operation_type="video_generation", model_name="minimax/video-01",
             video_seconds=_VIDEO_WITH_CHARACTER_DURATION,
-            metadata={"scene_url": char_scene_url[:60], "size": "720x1280"},
+            metadata={"scene_url": char_scene_url[:60], "size": image_size},
         )
 
         v = VideoDB(
             id=video_id, channel_id=channel_id, channel_name=ch.name,
             prompt=lora_prompt, caption=caption, video_path=blob_url,
-            duration_seconds=_VIDEO_WITH_CHARACTER_DURATION, size="720x1280",
+            duration_seconds=_VIDEO_WITH_CHARACTER_DURATION, size=image_size,
             published=False, credits_consumed=total_credits,
         )
         db.add(v)
@@ -395,7 +408,7 @@ def generate_video_with_character(
 
     thread = threading.Thread(
         target=_run_character_video_job,
-        args=(job_id, current_user.id, ch.id, data.additional_prompt or ""),
+        args=(job_id, current_user.id, ch.id, data.additional_prompt or "", data.size or "1024x1792", data.voice_script or ""),
         daemon=True,
     )
     thread.start()

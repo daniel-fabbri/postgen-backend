@@ -13,3 +13,5 @@ passlib[bcrypt]==1.7.4
 bcrypt==3.2.2
 azure-storage-blob==12.23.1
 mercadopago==2.2.3
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84

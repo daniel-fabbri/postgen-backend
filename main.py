@@ -68,6 +68,9 @@ def on_startup():
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits_balance FLOAT DEFAULT 0.0"))
             conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_reply_enabled BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_reply_prompt TEXT"))
+            conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS lora_training_id VARCHAR(100)"))
+            conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS lora_status VARCHAR(20)"))
+            conn.execute(text("ALTER TABLE channels ADD COLUMN IF NOT EXISTS lora_version VARCHAR(200)"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS reference_images (
                     id SERIAL PRIMARY KEY,

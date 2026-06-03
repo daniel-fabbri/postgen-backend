@@ -26,6 +26,12 @@ AZURE_SORA_API_KEY = os.getenv("AZURE_SORA_API_KEY", "")
 GPT_IMAGE_2_ENDPOINT = os.getenv("GPT_IMAGE_2_ENDPOINT", "https://postgen-ai.openai.azure.com").rstrip("/")
 GPT_IMAGE_2_API_KEY = os.getenv("GPT_IMAGE_2_API_KEY", "")
 
+# Azure OpenAI — GPT-4o / visão (stocks-foundry-ai)
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+
 # Azure AI Foundry — FLUX.1-Kontext-pro e FLUX.2-pro
 AZURE_FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT", "").rstrip("/")
 AZURE_FOUNDRY_API_KEY = os.getenv("AZURE_FOUNDRY_API_KEY", "")
@@ -38,6 +44,8 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
 ADMIN_EMAIL = "daniel.fabbri@avanade.com"
 INSTAGRAM_WEBHOOK_VERIFY_TOKEN = os.getenv("INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "postgen_webhook_secret_2026")

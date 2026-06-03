@@ -39,6 +39,7 @@ class ChannelDB(Base):
     lora_training_id = Column(String(100), nullable=True)
     lora_status = Column(String(20), nullable=True)
     lora_version = Column(String(200), nullable=True)
+    elevenlabs_voice_id = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user = relationship("UserDB", back_populates="channels")
     posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
