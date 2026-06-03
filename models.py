@@ -36,6 +36,9 @@ class ChannelDB(Base):
     image_model = Column(String(20), default="mai")
     auto_reply_enabled = Column(Boolean, default=False)
     auto_reply_prompt = Column(Text, nullable=True)
+    lora_training_id = Column(String(100), nullable=True)
+    lora_status = Column(String(20), nullable=True)
+    lora_version = Column(String(200), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     user = relationship("UserDB", back_populates="channels")
     posts = relationship("PostDB", back_populates="channel", cascade="all, delete-orphan")
@@ -162,6 +165,19 @@ class CreditUsageDB(Base):
     credits_consumed = Column(Float, default=0.0)
     meta_info = Column(Text, default="{}")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class VideoJobDB(Base):
+    """Job assíncrono para geração de vídeo com personagem (evita timeout 240s do Container Apps)."""
+    __tablename__ = "video_jobs"
+    id = Column(String(50), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    channel_id = Column(String(50), nullable=True)
+    status = Column(String(20), default="processing")  # processing / completed / failed
+    video_id = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class SystemConfigDB(Base):

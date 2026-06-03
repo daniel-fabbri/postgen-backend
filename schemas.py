@@ -63,6 +63,8 @@ class Channel(BaseModel):
     image_model: Optional[str] = "mai"
     auto_reply_enabled: Optional[bool] = False
     auto_reply_prompt: Optional[str] = None
+    lora_status: Optional[str] = None
+    lora_version: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -181,6 +183,13 @@ class SavedVideo(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class VideoJobOut(BaseModel):
+    job_id: str
+    status: str  # processing / completed / failed
+    video: Optional[SavedVideo] = None
+    error: Optional[str] = None
 
 
 class UpdateVideoCaptionRequest(BaseModel):

@@ -15,6 +15,9 @@ CREDIT_COSTS = {
     "mai": {"per_image": 30.0},
     "gpt-image-2": {"per_image": 35.0},
     "sora-2": {"per_second": 50.0},
+    "minimax/video-01": {"per_second": 50.0},
+    "replicate/flux-lora": {"per_image": 30.0},
+    "replicate/flux-pulid": {"per_image": 20.0},
     "tts": {"per_1k_chars": 15.0},
 }
 

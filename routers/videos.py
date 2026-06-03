@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Optional, List
@@ -17,11 +18,11 @@ from dependencies import (
     get_current_user, get_or_create_settings, get_azure_client,
     get_channel_or_404, get_video_or_404,
 )
-from models import UserDB, ChannelDB, VideoDB, VideoProjectDB
+from models import UserDB, ChannelDB, VideoDB, VideoProjectDB, VideoJobDB
 from schemas import (
     GenerateVideoRequest, SavedVideo, UpdateVideoCaptionRequest,
     VideoProjectOut, CreateVideoProjectRequest, UpdateVideoProjectClipsRequest,
-    GenerateProjectClipRequest, AddVideoToProjectRequest,
+    GenerateProjectClipRequest, AddVideoToProjectRequest, VideoJobOut,
 )
 from services.azure_ai import generate_image_bytes, identify_main_person_bbox, create_inpaint_mask
 from services.blob_storage import upload_bytes_to_blob
@@ -220,25 +221,164 @@ Retorne apenas o texto da legenda."""
 _VIDEO_WITH_CHARACTER_DURATION = 6  # minimax/video-01 gera ~6s fixos
 
 
-@router.post("/api/videos/generate-with-character", response_model=SavedVideo)
+def _run_character_video_job(job_id: str, user_id: int, channel_id: str, additional_prompt: str):
+    """
+    Roda o pipeline GPT-Image-2 → LoRA inpainting → MiniMax em background thread.
+    Usa sua própria sessão de DB — não reutiliza a sessão do request (não é thread-safe).
+    """
+    from database import SessionLocal as _SL
+    db = _SL()
+    try:
+        ch = db.query(ChannelDB).filter(ChannelDB.id == channel_id).first()
+        user = db.query(UserDB).filter(UserDB.id == user_id).first()
+        s = get_or_create_settings(user, db)
+
+        frame_id = f"charframe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        base_prompt = ch.image_generation_prompt or f"Portrait photo of a person, {ch.objective}"
+
+        # Step 1: GPT-Image-2 — cena rica com pessoa
+        scene_prompt = (
+            f"{base_prompt}, portrait photo, person facing camera, upper body visible"
+            + (f", {additional_prompt}" if additional_prompt else "")
+        )[:4000]
+        print(f"[CHARACTER JOB {job_id}] Step 1 – GPT-Image-2 | {scene_prompt[:60]}")
+        scene_bytes = generate_image_bytes(scene_prompt, ch, s, db)
+        scene_url = upload_bytes_to_blob(scene_bytes, f"temp/{frame_id}_scene.png", "image/png")
+
+        total_credits = register_credit_usage(
+            db=db, user_id=user_id, channel_id=channel_id,
+            resource_type="video", resource_id=None,
+            operation_type="image_generation", model_name="gpt-image-2",
+            images_count=1, metadata={"step": "scene_generation"},
+        )
+
+        # Step 2: Detectar rosto → máscara
+        mask_url = None
+        bbox = identify_main_person_bbox(scene_url, ch.image_generation_prompt or "")
+        print(f"[CHARACTER JOB {job_id}] Step 2 – face detection: bbox={'found' if bbox else 'none'}")
+        if bbox:
+            mask_bytes = create_inpaint_mask(bbox)
+            mask_url = upload_bytes_to_blob(mask_bytes, f"temp/{frame_id}_mask.png", "image/png")
+
+        # Step 3: LoRA inpainting (ou img2img se não detectou rosto)
+        lora_prompt = (
+            f"TOK, {base_prompt}"
+            + (f", {additional_prompt}" if additional_prompt else "")
+        )[:2000]
+        mode_log = "inpainting" if mask_url else "img2img"
+        print(f"[CHARACTER JOB {job_id}] Step 3 – LoRA {mode_log}")
+        lora_image_bytes = generate_with_lora(
+            prompt=lora_prompt,
+            lora_ref=ch.lora_version,
+            api_key=REPLICATE_API_KEY,
+            base_image_url=scene_url,
+            mask_url=mask_url,
+        )
+        char_scene_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}_char.png", "image/png")
+
+        total_credits += register_credit_usage(
+            db=db, user_id=user_id, channel_id=channel_id,
+            resource_type="video", resource_id=None,
+            operation_type="image_generation", model_name="replicate/flux-lora",
+            images_count=1, metadata={"step": "lora_inpaint", "mode": mode_log},
+        )
+
+        # Step 4: MiniMax — animar a cena
+        motion_prompt = (
+            f"{base_prompt}" + (f", {additional_prompt}" if additional_prompt else "")
+        )[:2000]
+        print(f"[CHARACTER JOB {job_id}] Step 4 – minimax/video-01")
+        video_bytes = generate_video_from_image(
+            image_url=char_scene_url,
+            prompt=motion_prompt,
+            api_key=REPLICATE_API_KEY,
+        )
+
+        # Step 5: Legenda
+        caption = ""
+        try:
+            client = get_azure_client(s)
+            text_prompt = ch.text_generation_prompt or (
+                f'Crie uma legenda para um Instagram Reel do canal "{ch.name}".\n'
+                f"Objetivo: {ch.objective}\nConceito: {additional_prompt or motion_prompt}\n"
+                "Escreva uma legenda envolvente com emojis e hashtags, 80-150 palavras. Retorne só o texto."
+            )
+            cap_resp = client.chat.completions.create(
+                model=s.azure_openai_deployment_name,
+                messages=[
+                    {"role": "system", "content": "Você é um especialista em conteúdo para Instagram."},
+                    {"role": "user", "content": text_prompt},
+                ],
+                max_tokens=400, temperature=0.7,
+            )
+            caption = cap_resp.choices[0].message.content.strip()
+            cap_usage = cap_resp.usage
+            total_credits += register_credit_usage(
+                db=db, user_id=user_id, channel_id=channel_id,
+                resource_type="video", resource_id=None,
+                operation_type="text_generation", model_name=s.azure_openai_deployment_name,
+                input_tokens=cap_usage.prompt_tokens, output_tokens=cap_usage.completion_tokens,
+                metadata={"step": "caption_generation"},
+            )
+        except Exception as e:
+            print(f"[CHARACTER JOB {job_id}] Caption failed: {e}")
+
+        # Upload vídeo
+        video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        blob_url = upload_bytes_to_blob(video_bytes, f"videos/{video_id}.mp4", "video/mp4")
+
+        total_credits += register_credit_usage(
+            db=db, user_id=user_id, channel_id=channel_id,
+            resource_type="video", resource_id=video_id,
+            operation_type="video_generation", model_name="minimax/video-01",
+            video_seconds=_VIDEO_WITH_CHARACTER_DURATION,
+            metadata={"scene_url": char_scene_url[:60], "size": "720x1280"},
+        )
+
+        v = VideoDB(
+            id=video_id, channel_id=channel_id, channel_name=ch.name,
+            prompt=lora_prompt, caption=caption, video_path=blob_url,
+            duration_seconds=_VIDEO_WITH_CHARACTER_DURATION, size="720x1280",
+            published=False, credits_consumed=total_credits,
+        )
+        db.add(v)
+
+        job = db.query(VideoJobDB).filter(VideoJobDB.id == job_id).first()
+        if job:
+            job.status = "completed"
+            job.video_id = video_id
+
+        db.commit()
+        print(f"[CHARACTER JOB {job_id}] ✓ Concluído: video_id={video_id}")
+
+    except Exception as e:
+        import traceback
+        print(f"[CHARACTER JOB {job_id}] ✗ Falhou: {e}")
+        traceback.print_exc()
+        try:
+            job = db.query(VideoJobDB).filter(VideoJobDB.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error_message = str(e)[:500]
+                db.commit()
+        except Exception as e2:
+            print(f"[CHARACTER JOB {job_id}] ✗ Erro ao salvar falha: {e2}")
+    finally:
+        db.close()
+
+
+@router.post("/api/videos/generate-with-character", response_model=VideoJobOut)
 def generate_video_with_character(
     data: GenerateVideoRequest,
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Gera vídeo com personagem via GPT-Image-2 + LoRA inpainting + minimax/video-01.
-    Requer LoRA treinado (ch.lora_status == "succeeded").
-    Fluxo:
-      1. GPT-Image-2 gera cena rica com a pessoa (iluminação, background, composição)
-      2. OpenCV detecta o rosto na cena e cria máscara
-      3. LoRA inpainting substitui só o rosto pelo personagem do canal (TOK)
-         – se não houver rosto detectado, usa img2img na cena inteira (fallback)
-      4. minimax/video-01 anima a cena com o personagem
-      5. GPT-4o gera legenda
+    Inicia geração de vídeo com personagem de forma assíncrona.
+    Retorna job_id imediatamente — use GET /api/videos/character-job/{job_id} para polling.
+    Pipeline rodando em background: GPT-Image-2 → LoRA inpainting → MiniMax → legenda.
     """
     ch = get_channel_or_404(data.channel_id, current_user, db)
-    s = get_or_create_settings(current_user, db)
 
     if ch.lora_status != "succeeded" or not ch.lora_version:
         raise HTTPException(
@@ -248,132 +388,48 @@ def generate_video_with_character(
     if not REPLICATE_API_KEY:
         raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado no servidor.")
 
-    frame_id = f"charframe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    base_prompt = ch.image_generation_prompt or f"Portrait photo of a person, {ch.objective}"
-
-    # 1. GPT-Image-2: cena de alta qualidade com pessoa visível
-    scene_prompt = (
-        f"{base_prompt}, portrait photo, person facing camera, upper body visible"
-        + (f", {data.additional_prompt}" if data.additional_prompt else "")
-    )[:4000]
-
-    print(f"[VIDEO-WITH-CHARACTER] Step 1 – GPT-Image-2 | prompt={scene_prompt[:80]}")
-    scene_bytes = generate_image_bytes(scene_prompt, ch, s, db)
-    scene_url = upload_bytes_to_blob(scene_bytes, f"temp/{frame_id}_scene.png", "image/png")
-    print(f"[VIDEO-WITH-CHARACTER] Cena gerada: {scene_url[:60]}")
-
-    total_credits = 0.0
-    total_credits += register_credit_usage(
-        db=db, user_id=current_user.id, channel_id=ch.id,
-        resource_type="video", resource_id=None,
-        operation_type="image_generation", model_name="gpt-image-2",
-        images_count=1, metadata={"step": "scene_generation"},
-    )
-
-    # 2. Detectar rosto na cena → máscara para inpainting cirúrgico
-    mask_url = None
-    bbox = identify_main_person_bbox(scene_url, ch.image_generation_prompt or "")
-    print(f"[VIDEO-WITH-CHARACTER] Step 2 – face detection: bbox={bbox}")
-    if bbox:
-        mask_bytes = create_inpaint_mask(bbox)
-        mask_url = upload_bytes_to_blob(mask_bytes, f"temp/{frame_id}_mask.png", "image/png")
-
-    # 3. LoRA inpainting (inpaint se rosto detectado, img2img como fallback)
-    lora_prompt = (
-        f"TOK, {base_prompt}"
-        + (f", {data.additional_prompt}" if data.additional_prompt else "")
-    )[:2000]
-
-    mode_log = "inpainting" if mask_url else "img2img (sem rosto detectado)"
-    print(f"[VIDEO-WITH-CHARACTER] Step 3 – LoRA {mode_log}")
-    lora_image_bytes = generate_with_lora(
-        prompt=lora_prompt,
-        lora_ref=ch.lora_version,
-        api_key=REPLICATE_API_KEY,
-        base_image_url=scene_url,
-        mask_url=mask_url,
-    )
-    char_scene_url = upload_bytes_to_blob(lora_image_bytes, f"temp/{frame_id}_char.png", "image/png")
-    print(f"[VIDEO-WITH-CHARACTER] Cena com personagem: {char_scene_url[:60]}")
-
-    total_credits += register_credit_usage(
-        db=db, user_id=current_user.id, channel_id=ch.id,
-        resource_type="video", resource_id=None,
-        operation_type="image_generation", model_name="replicate/flux-lora",
-        images_count=1, metadata={"step": "lora_inpaint", "mode": mode_log},
-    )
-
-    # 4. MiniMax: animar a cena com o personagem
-    motion_prompt = (
-        f"{base_prompt}"
-        + (f", {data.additional_prompt}" if data.additional_prompt else "")
-    )[:2000]
-
-    print(f"[VIDEO-WITH-CHARACTER] Step 4 – minimax/video-01 | prompt={motion_prompt[:80]}")
-    video_bytes = generate_video_from_image(
-        image_url=char_scene_url,
-        prompt=motion_prompt,
-        api_key=REPLICATE_API_KEY,
-    )
-
-    # 5. Legenda via GPT-4o
-    caption = ""
-    try:
-        client = get_azure_client(s)
-        text_prompt = ch.text_generation_prompt or f"""Crie uma legenda para um Instagram Reel do canal "{ch.name}".
-Objetivo do canal: {ch.objective}
-Conceito do vídeo: {data.additional_prompt or motion_prompt}
-Escreva uma legenda envolvente com emojis e hashtags relevantes, 80-150 palavras.
-Retorne apenas o texto da legenda."""
-        cap_resp = client.chat.completions.create(
-            model=s.azure_openai_deployment_name,
-            messages=[
-                {"role": "system", "content": "Você é um especialista em conteúdo para Instagram."},
-                {"role": "user", "content": text_prompt},
-            ],
-            max_tokens=400, temperature=0.7,
-        )
-        caption = cap_resp.choices[0].message.content.strip()
-        cap_usage = cap_resp.usage
-        total_credits += register_credit_usage(
-            db=db, user_id=current_user.id, channel_id=ch.id,
-            resource_type="video", resource_id=None,
-            operation_type="text_generation", model_name=s.azure_openai_deployment_name,
-            input_tokens=cap_usage.prompt_tokens, output_tokens=cap_usage.completion_tokens,
-            metadata={"step": "video_caption_generation"},
-        )
-    except Exception as e:
-        print(f"[VIDEO-WITH-CHARACTER] Caption generation failed: {e}")
-
-    # 6. Upload do vídeo
-    video_id = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    blob_url = upload_bytes_to_blob(video_bytes, f"videos/{video_id}.mp4", "video/mp4")
-
-    # 7. Registrar créditos (LoRA frame + minimax video como operação única)
-    total_credits += register_credit_usage(
-        db=db, user_id=current_user.id, channel_id=ch.id,
-        resource_type="video", resource_id=video_id,
-        operation_type="video_generation", model_name="minimax/video-01",
-        video_seconds=_VIDEO_WITH_CHARACTER_DURATION,
-        metadata={"scene_url": char_scene_url[:60], "size": "720x1280", "lora_version": str(ch.lora_version)[:16]},
-    )
-
-    # 8. Persistir
-    v = VideoDB(
-        id=video_id, channel_id=ch.id, channel_name=ch.name,
-        prompt=lora_frame_prompt, caption=caption, video_path=blob_url,
-        duration_seconds=_VIDEO_WITH_CHARACTER_DURATION, size="720x1280",
-        published=False, credits_consumed=total_credits,
-    )
-    db.add(v)
+    job_id = f"charjob_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    job = VideoJobDB(id=job_id, user_id=current_user.id, channel_id=ch.id, status="processing")
+    db.add(job)
     db.commit()
-    db.execute(
-        text("UPDATE credit_usage SET resource_id = :video_id WHERE resource_id IS NULL AND user_id = :user_id AND channel_id = :channel_id"),
-        {"video_id": video_id, "user_id": current_user.id, "channel_id": ch.id},
+
+    thread = threading.Thread(
+        target=_run_character_video_job,
+        args=(job_id, current_user.id, ch.id, data.additional_prompt or ""),
+        daemon=True,
     )
-    db.commit()
-    db.refresh(v)
-    return video_to_schema(v)
+    thread.start()
+    print(f"[CHARACTER JOB {job_id}] Iniciado em background thread")
+
+    return VideoJobOut(job_id=job_id, status="processing")
+
+
+@router.get("/api/videos/character-job/{job_id}", response_model=VideoJobOut)
+def get_character_job(
+    job_id: str,
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Polling endpoint — retorna status do job e o vídeo quando concluído."""
+    job = db.query(VideoJobDB).filter(
+        VideoJobDB.id == job_id,
+        VideoJobDB.user_id == current_user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    video = None
+    if job.status == "completed" and job.video_id:
+        v = db.query(VideoDB).filter(VideoDB.id == job.video_id).first()
+        if v:
+            video = video_to_schema(v)
+
+    return VideoJobOut(
+        job_id=job_id,
+        status=job.status,
+        video=video,
+        error=job.error_message,
+    )
 
 
 @router.delete("/api/videos/{video_id}", status_code=204)
