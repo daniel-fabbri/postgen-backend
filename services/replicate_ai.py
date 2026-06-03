@@ -384,7 +384,7 @@ def generate_with_lora(
     elif base_image_url:
         # img2img sem máscara: preserva cena em geral
         lora_input["image"] = base_image_url
-        lora_input["prompt_strength"] = 0.50
+        lora_input["prompt_strength"] = 0.65
     else:
         lora_input["aspect_ratio"] = aspect_ratio
 
@@ -630,7 +630,7 @@ def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
             "input": {
                 "face": video_url,
                 "audio": audio_url,
-                "pads": "0 0 0 0",
+                "pads": "0 5 0 0",
                 "smooth": True,
                 "resize_factor": 1,
             }
