@@ -531,30 +531,34 @@ def _download_output(prediction: dict) -> bytes:
     return resp.content
 
 
+_WAV2LIP_VERSION = "8d65e3f4f4298520e079198b493c25adfc43c058ffec924f2aefc8010ed25eef"
+
+
 def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
     """
-    Aplica lipsync no vídeo usando zsxkib/latentsync no Replicate.
-    video_url: URL pública do vídeo MP4 gerado pelo MiniMax.
+    Aplica lipsync no vídeo usando devxpy/cog-wav2lip no Replicate.
+    video_url: URL pública do vídeo MP4 gerado pelo MiniMax (contém o rosto).
     audio_url: URL pública do áudio MP3 com a voz clonada.
     Retorna bytes do vídeo MP4 com lipsync + áudio embutido.
     """
     if not api_key:
         raise HTTPException(status_code=400, detail="REPLICATE_API_KEY não configurado")
 
-    print(f"[REPLICATE] latentsync | video={video_url[:60]} | audio={audio_url[:60]}")
+    print(f"[REPLICATE] wav2lip | video={video_url[:60]} | audio={audio_url[:60]}")
 
     create_resp = requests.post(
-        f"{_REPLICATE_API}/models/zsxkib/latentsync/predictions",
+        f"{_REPLICATE_API}/predictions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         json={
+            "version": _WAV2LIP_VERSION,
             "input": {
-                "video_path": video_url,
-                "audio_path": audio_url,
-                "guidance_scale": 1.5,
-                "inference_steps": 20,
+                "face": video_url,
+                "audio": audio_url,
+                "smooth": True,
+                "resize_factor": 1,
             }
         },
         timeout=30,
@@ -563,18 +567,18 @@ def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
     if not create_resp.ok:
         raise HTTPException(
             status_code=create_resp.status_code,
-            detail=f"Replicate latentsync error: {create_resp.text[:400]}",
+            detail=f"Replicate wav2lip error: {create_resp.text[:400]}",
         )
 
     prediction = create_resp.json()
     status = prediction.get("status")
     prediction_id = prediction.get("id")
-    print(f"[REPLICATE] latentsync prediction {prediction_id} status={status}")
+    print(f"[REPLICATE] wav2lip prediction {prediction_id} status={status}")
 
     if status == "succeeded":
         return _download_video_output(prediction)
     if status in ("failed", "canceled"):
-        raise HTTPException(status_code=500, detail=f"latentsync falhou: {prediction.get('error')}")
+        raise HTTPException(status_code=500, detail=f"wav2lip falhou: {prediction.get('error')}")
 
     for attempt in range(200):  # 200 × 3s = 10 minutos
         time.sleep(_POLL_INTERVAL)
@@ -587,10 +591,10 @@ def generate_lipsync(video_url: str, audio_url: str, api_key: str) -> bytes:
             continue
         result = poll.json()
         status = result.get("status")
-        print(f"[REPLICATE] latentsync poll {attempt+1}/200 status={status}")
+        print(f"[REPLICATE] wav2lip poll {attempt+1}/200 status={status}")
         if status == "succeeded":
             return _download_video_output(result)
         if status in ("failed", "canceled"):
-            raise HTTPException(status_code=500, detail=f"latentsync falhou: {result.get('error')}")
+            raise HTTPException(status_code=500, detail=f"wav2lip falhou: {result.get('error')}")
 
-    raise HTTPException(status_code=504, detail="latentsync não concluiu em 10 minutos")
+    raise HTTPException(status_code=504, detail="wav2lip não concluiu em 10 minutos")
